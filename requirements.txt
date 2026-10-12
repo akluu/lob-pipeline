@@ -1,0 +1,6 @@
+pyspark==4.2.0
+pandas==2.3.3
+numpy==2.5.4
+pyarrow==26.0.0
+databento==0.87.0
+pytest==9.1.1

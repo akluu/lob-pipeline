@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# market data is licensed and never committed
+data/
+*.dbn
+*.dbn.zst
+*.parquet
+*.csv
