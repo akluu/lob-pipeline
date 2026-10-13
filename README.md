@@ -8,6 +8,14 @@ about 486 million order messages.
 
 ## How it works
 
+```mermaid
+flowchart LR
+    A["Databento MBO files<br/>.dbn.zst"] -->|ingest| B[("MBO Parquet<br/>one folder per UTC day")]
+    B -->|spark_job| C[("LOBSTER rows<br/>Parquet, one folder per day")]
+    C -->|export| D["LOBSTER CSV<br/>message + orderbook"]
+    D -->|check| E["consistency report"]
+```
+
 1. `ingest` converts Databento `.dbn.zst` files to Parquet, one partition per UTC day.
 2. `spark_job` rebuilds the order book for every instrument-day in parallel. Each MBO
    record becomes zero, one or two LOBSTER events, and each event is written with the
@@ -19,6 +27,41 @@ about 486 million order messages.
 Every day in these files starts with a book snapshot (Databento's at 00:00 UTC, or CME's
 at the Sunday reopen), so days are independent and can be rebuilt in parallel. The
 rebuild refuses a day that does not start with one.
+
+### Inside the Spark job
+
+An order book is stateful: each message is read against the book left by the ones
+before it, so the messages of one instrument-day have to be replayed in order by one
+worker. The job
+
+1. reads the MBO Parquet and hash-partitions it on `(instrument_id, date)`, so every
+   row of an instrument-day lands in the same partition,
+2. sorts each partition by `(instrument_id, date, row_nr)`, where `row_nr` is the
+   record's position in the original files,
+3. runs `mapInPandas`, which streams each partition to a Python worker in Arrow
+   batches; the worker starts a new `Book` whenever the instrument-day changes, feeds
+   the rows through it and yields LOBSTER rows,
+4. writes the result as Parquet partitioned by date.
+
+Spark handles the partitioning, sorting and parallelism; the book logic is plain Python
+in `lobpipe/book.py` and is tested without Spark.
+
+On a laptop (Apple M1 Pro, 16 GB, Spark `local[4]`), the full two months take about
+4 minutes to ingest and 46 minutes for `spark_job --verify`, which writes 368 million
+LOBSTER rows (9 GB of Parquet).
+
+### Layout
+
+```
+lobpipe/ingest.py      DBN files -> MBO Parquet
+lobpipe/book.py        order book and the MBO -> LOBSTER event rules
+lobpipe/transform.py   runs a Book over one instrument-day
+lobpipe/spark_job.py   the Spark job
+lobpipe/export.py      LOBSTER CSV files
+lobpipe/check.py       CSV-only consistency check
+scripts/               validation against snapshots and a single-process rebuild
+tests/                 unit tests on synthetic data
+```
 
 ## Usage
 
