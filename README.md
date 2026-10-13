@@ -58,14 +58,23 @@ guessing.
 
 - Every fill has to add up to its trade, and every cancel or modify has to match the
   order it refers to. All 486 million messages pass.
-- On the days checked, the rebuilt book at the end of the day matches Databento's
-  next-day snapshot order for order.
+- The book left at the end of each day matches the snapshot that opens the next day,
+  order for order (side, price, size): 44 of 44 day boundaries.
+- The Spark output equals a plain single-process rebuild, row for row, on all 53 days
+  (368,037,596 rows).
 - `check` replays the exported CSV files on their own, with no access to the source data.
 - The files load in [LOBFrame](https://github.com/FinancialComputingUCL/LOBFrame)
   (commit `c47549d`), the code behind *Deep Limit Order Book Forecasting* (Briola,
   Bartolucci, Aste), without changes. Its data processing and labels run on ten days of
   output, and DeepLOB trained for one epoch on CPU. Its evaluation stage was not run to
   completion.
+
+The snapshot and Spark comparisons run with:
+
+```
+python scripts/check_snapshots.py --mbo data/mbo
+python scripts/compare_spark.py --mbo data/mbo --lob data/lob
+```
 
 ## Tests
 
