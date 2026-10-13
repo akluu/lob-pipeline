@@ -1,16 +1,15 @@
+import os
+
 import pytest
 
 
 @pytest.fixture(scope="session")
 def spark():
-    from pyspark.sql import SparkSession
+    from lobpipe.spark_job import session
 
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("lobpipe-tests")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "4")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
+    # start the way the job does, with nothing set in the environment
+    os.environ.pop("PYSPARK_PYTHON", None)
+    spark = session(name="lobpipe-tests", master="local[2]", driver_memory="2g")
+    spark.conf.set("spark.sql.shuffle.partitions", "4")
+    yield spark
+    spark.stop()

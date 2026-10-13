@@ -7,6 +7,7 @@ instrument-day in file order and can stream them through a Book.
 """
 
 import argparse
+import os
 import sys
 from functools import partial
 
@@ -62,6 +63,9 @@ def build(spark, src, levels=10, dates=None, partitions=64, verify=False):
 
 
 def session(name="lobpipe", master="local[4]", batch=50_000, driver_memory="4g"):
+    # started from a running interpreter, PySpark ignores spark.pyspark.python, so point
+    # the workers at this interpreter (and its packages) explicitly
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     return (SparkSession.builder.master(master).appName(name)
             .config("spark.pyspark.python", sys.executable)
             .config("spark.sql.execution.arrow.maxRecordsPerBatch", str(batch))
