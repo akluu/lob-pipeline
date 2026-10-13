@@ -33,7 +33,8 @@ python -m lobpipe.check data/lobster/*message_10.csv
 ```
 
 `--verify` rebuilds the book a second way from adds, cancels and modifies only and
-stops if the two ever disagree. Market data is not included in this repo.
+stops if the two disagree after any event. Market data is not included in this repo;
+the `.dbn.zst` names above stand for your own Databento files.
 
 ## Event mapping
 
@@ -58,8 +59,9 @@ guessing.
 
 - Every fill has to add up to its trade, and every cancel or modify has to match the
   order it refers to. All 486 million messages pass.
-- The book left at the end of each day matches the snapshot that opens the next day,
-  order for order (side, price, size): 44 of 44 day boundaries.
+- The book left at the end of a day matches the snapshot that opens the next calendar
+  day, order for order (side, price, size), on all 44 such pairs in the data. There is
+  no Saturday data, so Friday is never compared with Sunday.
 - The Spark output equals a plain single-process rebuild, row for row, on all 53 days
   (368,037,596 rows).
 - `check` replays the exported CSV files on their own, with no access to the source data.
