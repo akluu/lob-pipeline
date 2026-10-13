@@ -1,8 +1,8 @@
 """Convert Databento MBO (.dbn.zst) files to Parquet, partitioned by UTC date of ts_recv.
 
-Databento writes a book snapshot at 00:00 UTC each day, so every date partition can be
-replayed on its own. row_nr keeps the original file order, which is the order the
-book must be rebuilt in.
+Each date in these files begins with a book snapshot (Databento's at 00:00 UTC, or CME's
+at the Sunday reopen), so every date partition can be replayed on its own. row_nr keeps
+the original file order, which is the order the book must be rebuilt in.
 
 The dataset is built in <out>.partial and renamed to <out> only after every file has
 been written and _manifest.json is in place, so a failed run never leaves a dataset
