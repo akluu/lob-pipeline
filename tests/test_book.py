@@ -70,6 +70,39 @@ def test_iceberg_reserve_and_replenish():
     b.check()
 
 
+def test_fill_against_an_earlier_aggressor_that_was_never_shown():
+    # sell 60 hits bid 1, then buy 61 (never in the book) lifts 60's remainder before it is added
+    s = base().event(("T", "A", 60, 100.00, 1), ("F", "B", 1, 100.00, 1),
+                     ("T", "B", 61, 100.00, 1), ("F", "A", 60, 100.00, 1),
+                     ("M", "B", 1, 100.00, 4), ("A", "A", 60, 100.00, 2))
+    b, out = run(s)
+    assert msgs(out) == [(4, 1, 1, lob(100.00), 1), (5, 60, 1, lob(100.00), -1), (1, 60, 2, lob(100.00), -1)]
+    assert out[1][9:13] == out[0][9:13]  # type 5 leaves the depth alone
+    assert b.stats["unshown_remainder_execution"] == 1
+    b.check()
+
+
+@pytest.mark.parametrize("events", [
+    # no earlier trade by order 60 in the event
+    [[("T", "B", 61, 100.25, 1), ("F", "A", 60, 100.25, 1)]],
+    # earlier aggressor, but the fill is on the wrong side
+    [[("T", "A", 60, 100.00, 1), ("F", "B", 1, 100.00, 1), ("T", "A", 61, 100.00, 1), ("F", "B", 60, 100.00, 1),
+      ("M", "B", 1, 100.00, 4)]],
+    # earlier aggressor, but at another price
+    [[("T", "A", 60, 100.00, 1), ("F", "B", 1, 100.00, 1), ("T", "B", 61, 100.25, 1), ("F", "A", 60, 100.25, 1),
+      ("M", "B", 1, 100.00, 4)]],
+    # the aggressor traded in an earlier event, not this one
+    [[("T", "A", 60, 100.00, 1), ("F", "B", 1, 100.00, 1), ("M", "B", 1, 100.00, 4)],
+     [("T", "B", 61, 100.00, 1), ("F", "A", 60, 100.00, 1)]],
+])
+def test_rejects_other_fills_on_unknown_orders(events):
+    s = base()
+    for ev in events:
+        s.event(*ev)
+    with pytest.raises(BookError, match="unknown order"):
+        run(s)
+
+
 def test_resting_order_becomes_aggressor():
     # order 4 (ask 100.50 x2) is repriced through the bid and trades 2 at 100.00 against order 1
     s = base().event(("T", "A", 4, 100.00, 2), ("F", "A", 4, 100.00, 2), ("F", "B", 1, 100.00, 2),

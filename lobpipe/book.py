@@ -15,7 +15,9 @@ sequence not covered by the rules below raises BookError instead of being guesse
 
 LOBSTER event types written:
   1 new order, 2 partial cancel, 3 delete, 4 visible execution,
-  5 execution beyond the displayed size (iceberg reserve; depth unchanged)
+  5 execution against quantity that was never displayed (depth unchanged): the part
+    of a fill beyond an order's displayed size (iceberg reserve), or a fill against the
+    remainder of an aggressor from earlier in the same event that was never added
 Fills of the aggressing order itself are not written: LOBSTER records executions on
 the resting side. A modify that changes price or increases size is written as a
 delete followed by a new order with the same order id. Auction fills (side N) are
@@ -58,6 +60,7 @@ class Book:
         self.prices = {"B": [], "A": []}  # sorted ascending
         self.initialized = False
         self.max_time = None  # latest time_ns seen outside a reset; never moves backwards
+        self.unshown = {}  # aggressors earlier in this event that were never in the book -> (side, price)
         self.event = []  # records of the open event
         self.out = []
         self.stats = {}
@@ -184,12 +187,15 @@ class Book:
         if self.max_time is None or t > self.max_time:
             self.max_time = t
         resting = {r[5] for r in ev if r[3] == "T" and r[5] in self.orders}
+        self.unshown = {}
         group = None
         for r in ev:
             act = r[3]
             if act != "F" and group is not None:
                 self._close_group(group, resting)
                 group = None
+            if act in ("A", "C", "M"):
+                self.unshown.pop(r[5], None)
             if act == "A":
                 self._add(r)
             elif act == "C":
@@ -198,6 +204,8 @@ class Book:
                 self._modify(r)
             elif act == "T":
                 group = self._trade(r)
+                if r[4] in DIRECTION and r[5] not in self.orders:
+                    self.unshown[r[5]] = (r[4], r[6])
             elif act == "F":
                 if group is None:
                     raise BookError(f"row {r[0]}: fill without a trade summary")
@@ -258,6 +266,11 @@ class Book:
             return
         o = self.orders.get(oid)
         if o is None:
+            if self.unshown.get(oid) == (side, price) and side == OPPOSITE[t[4]] and price == t[6]:
+                g["passive"] += qty
+                self._emit(r, 0, 5, oid, qty, price, side)
+                self._count("unshown_remainder_execution")
+                return
             raise BookError(f"row {r[0]}: fill for unknown order {oid}")
         if side != OPPOSITE[t[4]] or o[0] != side:
             raise BookError(f"row {r[0]}: passive fill on the wrong side")
