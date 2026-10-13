@@ -61,12 +61,12 @@ def build(spark, src, levels=10, dates=None, partitions=64, verify=False):
     return df.mapInPandas(partial(rebuild_partition, levels=levels, verify=verify), output_schema(levels))
 
 
-def session(name="lobpipe", master="local[*]"):
+def session(name="lobpipe", master="local[4]", batch=50_000, driver_memory="4g"):
     return (SparkSession.builder.master(master).appName(name)
             .config("spark.pyspark.python", sys.executable)
-            .config("spark.sql.execution.arrow.maxRecordsPerBatch", "200000")
+            .config("spark.sql.execution.arrow.maxRecordsPerBatch", str(batch))
             .config("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
-            .config("spark.driver.memory", "6g")
+            .config("spark.driver.memory", driver_memory)
             .getOrCreate())
 
 
@@ -78,9 +78,11 @@ def main():
     p.add_argument("--dates", nargs="*", help="only these UTC dates (YYYY-MM-DD)")
     p.add_argument("--partitions", type=int, default=64)
     p.add_argument("--verify", action="store_true", help="check the book against A/C/M/R depth after every event")
-    p.add_argument("--master", default="local[*]")
+    p.add_argument("--master", default="local[4]", help="Spark master, e.g. local[4] or a cluster URL")
+    p.add_argument("--batch", type=int, default=50_000, help="rows per Arrow batch sent to Python")
+    p.add_argument("--driver-memory", default="4g")
     args = p.parse_args()
-    spark = session(master=args.master)
+    spark = session(master=args.master, batch=args.batch, driver_memory=args.driver_memory)
     out = build(spark, args.src, args.levels, args.dates, args.partitions, args.verify)
     out.write.mode("overwrite").partitionBy("date").parquet(args.out)
     spark.stop()
