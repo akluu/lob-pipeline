@@ -84,6 +84,9 @@ class Book:
     # ---- published depth ---------------------------------------------------
 
     def _change(self, side, price, qty):
+        if price <= 0 or price % PRICE_SCALE:
+            # calendar spreads can trade at zero or below; LOBSTER prices can't
+            raise BookError(f"price {price} is not a positive whole LOBSTER price")
         levels = self.depth[side]
         new = levels.get(price, 0) + qty
         if new < 0:
@@ -156,15 +159,18 @@ class Book:
         self.native = {"B": {}, "A": {}}
 
     def _snapshot(self, ev):
+        """A reset (R) followed by snapshot adds. Databento files from before February 2024
+        can open a day with the snapshot adds alone, without the reset record."""
         if self.max_time is not None and self.lo <= self.max_time < self.hi:
             raise BookError(f"row {ev[0][0]}: book reset inside the export window")
         if self.pending:
             raise BookError(f"row {ev[0][0]}: book reset with unconfirmed fills")
-        if ev[0][3] != "R" or any(r[3] != "A" or not r[8] & F_SNAPSHOT for r in ev[1:]):
+        adds = ev[1:] if ev[0][3] == "R" else ev
+        if any(r[3] != "A" or not r[8] & F_SNAPSHOT for r in adds):
             raise BookError(f"row {ev[0][0]}: malformed snapshot event")
         self._reset()
         self.initialized = False
-        for r in ev[1:]:
+        for r in adds:
             oid, side = r[5], r[4]
             if side not in DIRECTION or oid in self.orders:
                 raise BookError(f"row {r[0]}: bad snapshot order {oid} side {side}")
@@ -176,7 +182,7 @@ class Book:
         self._count("snapshot")
 
     def _run_event(self, ev):
-        if any(r[3] == "R" for r in ev):
+        if any(r[3] == "R" for r in ev) or (not self.initialized and all(r[8] & F_SNAPSHOT for r in ev)):
             self._snapshot(ev)
             return
         if not self.initialized:

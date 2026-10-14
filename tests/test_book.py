@@ -180,6 +180,30 @@ def test_rejects_events_before_or_outside_a_snapshot():
         run(Stream().snapshot(("B", 1, 100.0, 1), ("B", 1, 100.0, 2)))
 
 
+def test_a_day_can_open_with_snapshot_adds_and_no_reset():
+    with_reset = base().event(("A", "B", 10, 99.50, 1))
+    without = base().event(("A", "B", 10, 99.50, 1))
+    without.rows = without.rows[1:]  # files before February 2024 have no R record
+    (b1, out1), (b2, out2) = run(without), run(with_reset)
+    assert out1 == out2 and out1 and b1.orders == b2.orders
+    # but only a block made entirely of snapshot adds counts, and only before anything else
+    mixed = Stream()
+    mixed.rows.append((0, OUT, OUT, "A", "B", 1, px(100.0), 5, F_SNAPSHOT))
+    mixed.rows.append((1, OUT, OUT, "A", "B", 2, px(99.75), 5, F_LAST))
+    with pytest.raises(BookError, match="initialized"):
+        run(mixed)
+    flagged_cancel = Stream()
+    flagged_cancel.rows.append((0, OUT, OUT, "C", "B", 1, px(100.0), 5, F_SNAPSHOT | F_LAST))
+    with pytest.raises(BookError, match="malformed snapshot"):
+        run(flagged_cancel)
+
+
+@pytest.mark.parametrize("price", [0.0, -1.25, 100.00001])
+def test_rejects_prices_lobster_cannot_write(price):
+    with pytest.raises(BookError, match="positive whole LOBSTER price"):
+        run(base().event(("A", "B", 10, price, 1)))
+
+
 def test_output_does_not_depend_on_batching():
     s = random_stream(7)
     whole = Book(levels=5, verify=True)
