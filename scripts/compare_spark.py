@@ -7,11 +7,10 @@ with the same error). For the ones rebuilt, the Spark rows read back and sorted 
 values in every row (compared through a hash of each row). On a large dataset, run it
 on a sample with --dates.
 
-usage: python scripts/compare_spark.py --mbo data/mbo --lob data/lob [--dates D ...] [--workers 1]
+usage: python -m scripts.compare_spark --mbo data/mbo --lob data/lob [--dates D ...] [--workers 1]
 """
 
 import argparse
-import os
 import sys
 from collections import defaultdict
 from multiprocessing import Pool
@@ -21,11 +20,10 @@ import pandas as pd
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lobpipe.book import COLUMNS, book_columns  # noqa: E402
-from lobpipe.fs import exists, join, list_dates, resolve  # noqa: E402
-from lobpipe.spark_job import read_statuses  # noqa: E402
-from lobpipe.transform import OK, Day  # noqa: E402
+from lobpipe.book import COLUMNS, book_columns
+from lobpipe.fs import exists, join, list_dates, resolve
+from lobpipe.spark_job import read_statuses
+from lobpipe.transform import OK, Day
 
 VALUES = COLUMNS + book_columns(10)
 INPUT = ["row_nr", "ts_event", "instrument_id", "action", "side", "order_id", "price", "size", "flags"]

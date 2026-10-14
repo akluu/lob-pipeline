@@ -77,7 +77,8 @@ def read_header(uri):
 
 def to_batch(a, first_row):
     """A numpy array of DBN records as an Arrow batch; Arrow rejects values that don't fit."""
-    columns = {name: a[name] for name in SCHEMA.names if name in a.dtype.names}
+    columns = {name: a[name] for name in ["ts_recv", "ts_event", "instrument_id", "order_id", "price", "size",
+                                          "flags", "sequence"]}
     columns["row_nr"] = np.arange(first_row, first_row + len(a))
     columns["action"] = a["action"].astype("U1")
     columns["side"] = a["side"].astype("U1")

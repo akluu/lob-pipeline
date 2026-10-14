@@ -68,7 +68,7 @@ class Book:
             else:
                 row += [EMPTY_ASK, 0]
             if i < len(bids):
-                price = bids[-1 - i]  # bids are sorted ascending, best last
+                price = bids[-1 - i]
                 row += [price // PRICE_SCALE, self.depth["B"][price]]
             else:
                 row += [EMPTY_BID, 0]

@@ -81,13 +81,14 @@ def export(src, dates, out_dir, ticker="ES", levels=10, overwrite=False, instrum
     if os.path.exists(out_dir) and not overwrite:
         raise FileExistsError(f"{out_dir} exists (use --overwrite)")
     tmp, old = out_dir + ".partial", out_dir + ".old"
-    for leftover in (tmp, old):
-        if os.path.exists(leftover):
-            shutil.rmtree(leftover)
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
     os.makedirs(tmp)
     counts = {day: export_day(src, day, tmp, ticker, levels, instrument_id, ok) for day in dates}
-    if os.path.exists(out_dir):
-        os.replace(out_dir, old)  # the previous export is kept until the new one is in place
+    if os.path.exists(out_dir):  # keep the previous export as .old until the new one is in place
+        if os.path.exists(old):
+            shutil.rmtree(old)
+        os.replace(out_dir, old)
     os.replace(tmp, out_dir)
     if os.path.exists(old):
         shutil.rmtree(old)

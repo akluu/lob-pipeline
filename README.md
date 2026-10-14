@@ -177,8 +177,8 @@ The snapshot and Spark comparisons run with the commands below; on a large datas
 `--dates` to check a sample.
 
 ```
-python scripts/check_snapshots.py --mbo data/mbo
-python scripts/compare_spark.py --mbo data/mbo --lob data/lob
+python -m scripts.check_snapshots --mbo data/mbo
+python -m scripts.compare_spark --mbo data/mbo --lob data/lob
 ```
 
 ## Tests

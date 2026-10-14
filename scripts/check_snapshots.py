@@ -7,21 +7,19 @@ pair of consecutive calendar dates, for each instrument the ingest manifest list
 days. There is no Saturday data, so the Friday -> Sunday gap is never compared. On a large
 dataset, run it on a sample with --dates (each date is compared with the day after it).
 
-usage: python scripts/check_snapshots.py --mbo data/mbo [--dates D ...] [--workers 1]
+usage: python -m scripts.check_snapshots --mbo data/mbo [--dates D ...] [--workers 1]
 """
 
 import argparse
-import os
 import sys
 from datetime import date, timedelta
 from multiprocessing import Pool
 
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lobpipe.book import F_LAST  # noqa: E402
-from lobpipe.fs import join, read_json, resolve  # noqa: E402
-from lobpipe.transform import OK, Day  # noqa: E402
+from lobpipe.book import F_LAST
+from lobpipe.fs import join, read_json, resolve
+from lobpipe.transform import OK, Day
 
 COLUMNS = ["row_nr", "ts_event", "instrument_id", "action", "side", "order_id", "price", "size", "flags"]
 
@@ -53,8 +51,6 @@ def replay(rows, day, iid):
 
 def compare_pair(args):
     mbo, day, nxt, iid = args
-    # the next day must open with a valid snapshot: a reset and snapshot adds with unique
-    # order ids and a B or A side, not cut off before its last record
     expected, status = replay(opening_event(mbo, nxt, iid), nxt, iid)
     if status != OK:
         return day, nxt, iid, None, None, f"BAD SNAPSHOT ({status})"
