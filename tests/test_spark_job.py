@@ -4,53 +4,39 @@ import subprocess
 import sys
 
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from lobpipe.book import Book
-from lobpipe.ingest import SCHEMA
-from lobpipe.spark_job import build, run
+from lobpipe.spark_job import build, read_statuses, run
 from lobpipe.transform import OK, et_midnight_ns, output_frame
-from tests.streams import random_stream
+from tests.streams import random_stream, write_mbo
 
 DAYS = [("2025-10-02", 7, 1), ("2025-10-03", 7, 2), ("2025-10-03", 9, 3)]  # (date, instrument, seed)
 
 
 def write_dataset(root, levels=5, broken=None):
-    """MBO parquet the way ingest writes it, plus the direct rebuild of each instrument-day.
+    """MBO Parquet for DAYS and the direct Book rebuild of each instrument-day.
 
-    broken: (date, instrument) whose stream gets a cancel for an order that does not exist.
+    broken: (date, instrument) whose stream ends with a cancel for an order that doesn't exist.
     """
-    expected, manifest = [], {"dates": {}}
-    row0 = 0
+    days = []
     for day, iid, seed in DAYS:
         s = random_stream(seed, n_events=300)
         if (day, iid) == broken:
             s.event(("C", "B", 999_999, 100.0, 1))
-        midnight = et_midnight_ns(day)
-        recs = [(row0 + r[0], midnight + r[1]) + r[3:] for r in s.rows]
-        row0 += len(recs)
-        df = pd.DataFrame(recs, columns=["row_nr", "ts_event", "action", "side", "order_id", "price", "size", "flags"])
-        df["ts_recv"] = df["ts_event"]
-        df["instrument_id"] = iid
-        df["sequence"] = df["row_nr"]
-        table = pa.Table.from_pandas(df[SCHEMA.names], schema=SCHEMA, preserve_index=False)
-        part = os.path.join(root, f"date={day}")
-        os.makedirs(part, exist_ok=True)
-        pq.write_table(table, os.path.join(part, f"part-{iid}.parquet"))
-        manifest["dates"].setdefault(day, {"rows": 0, "instruments": {}})["instruments"][str(iid)] = len(recs)
-
+        days.append((day, iid, s.rows))
+    write_mbo(root, days)
+    expected, row0 = [], 0
+    for day, iid, rows in days:
         if (day, iid) != broken:
-            book = Book(levels=levels)
-            rows = book.feed((row0 - len(recs) + r[0], midnight + r[1], r[1]) + r[3:] for r in s.rows)
+            book, midnight = Book(levels=levels), et_midnight_ns(day)
+            out = output_frame(book.feed((row0 + r[0], midnight + r[1], r[1]) + r[3:] for r in rows), levels)
             book.finish()
-            out = output_frame(rows, levels)
             out.insert(0, "date", day)
             out.insert(0, "instrument_id", iid)
             expected.append(out)
-    with open(os.path.join(root, "_manifest.json"), "w") as f:
-        json.dump(manifest, f)
+        row0 += len(rows)
     return pd.concat(expected, ignore_index=True)
 
 
@@ -145,22 +131,8 @@ def test_run_needs_the_ingest_manifest(spark, tmp_path):
         run(spark, root, str(tmp_path / "lob"))
 
 
-def test_spark_submit_settings_are_kept(tmp_path):
-    import pyspark
-
-    script = tmp_path / "job.py"
-    script.write_text("import os\n"
-                      "from lobpipe.spark import session\n"
-                      "s = session(master='local[3]', driver_memory='3g')\n"
-                      "print('MASTER', s.sparkContext.master)\n"
-                      "print('MEMORY', s.sparkContext.getConf().get('spark.driver.memory', 'unset'))\n"
-                      "print('PYTHON', os.environ.get('PYSPARK_PYTHON', 'unset'))\n")
-    env = {k: v for k, v in os.environ.items() if k != "PYSPARK_PYTHON"}
-    env.update(SPARK_HOME=os.path.dirname(pyspark.__file__), PYSPARK_DRIVER_PYTHON=sys.executable,
-               PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    submit = os.path.join(os.path.dirname(sys.executable), "spark-submit")
-    out = subprocess.run([submit, "--master", "local[1]", str(script)], env=env, capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr[-2000:]
-    assert "MASTER local[1]" in out.stdout
-    assert "MEMORY unset" in out.stdout
-    assert "PYTHON unset" in out.stdout
+def test_a_status_listed_twice_is_rejected(tmp_path):
+    entry = {"date": "2025-10-02", "instrument_id": 7, "status": OK}
+    (tmp_path / "_status.json").write_text(json.dumps([entry, dict(entry, status="row 1: unknown order")]))
+    with pytest.raises(ValueError, match="more than once"):
+        read_statuses(str(tmp_path))

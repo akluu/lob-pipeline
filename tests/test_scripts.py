@@ -8,31 +8,12 @@ import pyarrow.parquet as pq
 import pytest
 
 from lobpipe.book import F_LAST, F_SNAPSHOT, Book
-from lobpipe.ingest import SCHEMA
 from lobpipe.spark_job import run
-from lobpipe.transform import et_midnight_ns
 from scripts import check_snapshots, compare_spark
-from tests.streams import OUT, Stream, random_stream
+from tests.streams import OUT, Stream, random_stream, write_mbo
 from tests.test_spark_job import write_dataset
 
 DAY1, DAY2 = "2025-10-02", "2025-10-03"
-
-
-def write_mbo(root, days):
-    """days: [(date, instrument_id, Stream rows)]; writes parquet the way ingest does, plus a manifest."""
-    manifest, row0 = {"dates": {}}, 0
-    for day, iid, rows in days:
-        midnight = et_midnight_ns(day)
-        df = pd.DataFrame([(row0 + r[0], midnight + r[1]) + r[3:] for r in rows],
-                          columns=["row_nr", "ts_event", "action", "side", "order_id", "price", "size", "flags"])
-        df["ts_recv"], df["instrument_id"], df["sequence"] = df["ts_event"], iid, df["row_nr"]
-        os.makedirs(os.path.join(root, f"date={day}"), exist_ok=True)
-        pq.write_table(pa.Table.from_pandas(df[SCHEMA.names], schema=SCHEMA, preserve_index=False),
-                       os.path.join(root, f"date={day}", "part-000.parquet"))
-        manifest["dates"].setdefault(day, {"instruments": {}})["instruments"][str(iid)] = len(rows)
-        row0 += len(rows)
-    with open(os.path.join(root, "_manifest.json"), "w") as f:
-        json.dump(manifest, f)
 
 
 def closing_book(stream):
@@ -93,8 +74,8 @@ def test_opening_event_is_found_by_row_number_not_file_name(tmp_path, monkeypatc
     write_mbo(str(tmp_path), [(DAY1, 7, day1.rows), (DAY2, 7, next_day(closing_book(day1)))])
     # split day 2 so the file with the snapshot sorts last by name
     folder = os.path.join(str(tmp_path), f"date={DAY2}")
-    table = pq.read_table(os.path.join(folder, "part-000.parquet"))
-    os.remove(os.path.join(folder, "part-000.parquet"))
+    table = pq.read_table(os.path.join(folder, "part-7.parquet"))
+    os.remove(os.path.join(folder, "part-7.parquet"))
     pq.write_table(table.slice(0, 5), os.path.join(folder, "part-zzz.parquet"))
     pq.write_table(table.slice(5), os.path.join(folder, "part-aaa.parquet"))
     assert run_main(check_snapshots, ["--mbo", str(tmp_path)], monkeypatch) == 0
@@ -174,17 +155,6 @@ def test_unfinished_spark_output_fails(spark_output, tmp_path, monkeypatch, mark
     mbo, lob = copy_of(spark_output, tmp_path)
     os.remove(os.path.join(lob, marker))
     assert run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch) != 0
-
-
-def test_status_listed_twice_is_rejected(spark_output, tmp_path, monkeypatch):
-    mbo, lob = copy_of(spark_output, tmp_path)
-    with open(os.path.join(lob, "_status.json")) as f:
-        statuses = json.load(f)
-    statuses.append(dict(statuses[0], status="row 1: failed after all"))
-    with open(os.path.join(lob, "_status.json"), "w") as f:
-        json.dump(statuses, f)
-    with pytest.raises(ValueError, match="more than once"):
-        run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch)
 
 
 def test_a_day_that_fails_in_both_is_not_a_difference(spark, tmp_path, monkeypatch, capsys):

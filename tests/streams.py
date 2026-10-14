@@ -1,6 +1,14 @@
+import json
+import os
 import random
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from lobpipe.book import F_LAST, F_SNAPSHOT
+from lobpipe.ingest import SCHEMA
+from lobpipe.transform import et_midnight_ns
 
 IN = 40_000 * 10**9  # inside the default 09:30-16:00 window
 OUT = 30_000 * 10**9  # before it
@@ -38,10 +46,10 @@ def base():
 
 def random_stream(seed, n_events=400):
     rng = random.Random(seed)
-    s = Stream().snapshot(*[("B", i, 100.0 - 0.25 * (i % 6), 1 + i % 3) for i in range(1, 13)],
-                          *[("A", i, 100.25 + 0.25 * (i % 6), 1 + i % 3) for i in range(13, 25)])
-    live = {i: ("B" if i < 13 else "A", 100.0 - 0.25 * (i % 6) if i < 13 else 100.25 + 0.25 * (i % 6), 1 + i % 3)
-            for i in range(1, 25)}
+    orders = ([("B", i, 100.0 - 0.25 * (i % 6), 1 + i % 3) for i in range(1, 13)]
+              + [("A", i, 100.25 + 0.25 * (i % 6), 1 + i % 3) for i in range(13, 25)])
+    s = Stream().snapshot(*orders)
+    live = {oid: (side, price, size) for side, oid, price, size in orders}
     nxt = 100
     for _ in range(n_events):
         kind = rng.random()
@@ -63,3 +71,21 @@ def random_stream(seed, n_events=400):
             s.event(("M", side, oid, price, new))
             live[oid] = (side, price, new)
     return s
+
+
+def write_mbo(root, days):
+    """days: [(date, instrument_id, Stream rows)]. Writes Parquet and a manifest the way
+    ingest does; row_nr runs on across the days in the order given."""
+    manifest, row0 = {"dates": {}}, 0
+    for day, iid, rows in days:
+        midnight = et_midnight_ns(day)
+        df = pd.DataFrame([(row0 + r[0], midnight + r[1]) + r[3:] for r in rows],
+                          columns=["row_nr", "ts_event", "action", "side", "order_id", "price", "size", "flags"])
+        df["ts_recv"], df["instrument_id"], df["sequence"] = df["ts_event"], iid, df["row_nr"]
+        os.makedirs(os.path.join(root, f"date={day}"), exist_ok=True)
+        pq.write_table(pa.Table.from_pandas(df[SCHEMA.names], schema=SCHEMA, preserve_index=False),
+                       os.path.join(root, f"date={day}", f"part-{iid}.parquet"))
+        manifest["dates"].setdefault(day, {"instruments": {}})["instruments"][str(iid)] = len(rows)
+        row0 += len(rows)
+    with open(os.path.join(root, "_manifest.json"), "w") as f:
+        json.dump(manifest, f)

@@ -113,7 +113,7 @@ def test_refuses_unfinished_spark_output(tmp_path):
         export(str(tmp_path / "lob"), [DAY], str(tmp_path / "csv"))
 
 
-def test_only_days_rebuilt_successfully_are_exported(tmp_path):
+def test_a_failed_day_is_not_exported(tmp_path):
     write_lob(tmp_path / "lob", statuses={DAYS[0]: "ok", DAYS[1]: "row 9: cancel for unknown order 5"})
     src = str(tmp_path / "lob")
     with pytest.raises(ValueError, match="rebuilt instruments \\[\\]"):
@@ -121,14 +121,13 @@ def test_only_days_rebuilt_successfully_are_exported(tmp_path):
     with pytest.raises(ValueError, match="not rebuilt successfully"):
         export(src, [DAYS[1]], str(tmp_path / "csv"), levels=5, instrument_id=7)
     assert export(src, [DAYS[0]], str(tmp_path / "csv"), levels=5, instrument_id=7)[DAYS[0]] > 500
-    listed_twice = json.loads((tmp_path / "lob" / "_status.json").read_text())
-    listed_twice.append({"date": DAYS[0], "instrument_id": 7, "status": "row 3: unknown order"})
-    (tmp_path / "lob" / "_status.json").write_text(json.dumps(listed_twice))
-    with pytest.raises(ValueError, match="more than once"):
-        export(src, [DAYS[0]], str(tmp_path / "csv2"), levels=5)
+
+
+def test_export_needs_the_status_file(tmp_path):
+    write_lob(tmp_path / "lob")
     os.remove(tmp_path / "lob" / "_status.json")
     with pytest.raises(FileNotFoundError, match="_status.json"):
-        export(src, [DAYS[0]], str(tmp_path / "csv2"), levels=5)
+        export(str(tmp_path / "lob"), [DAYS[0]], str(tmp_path / "csv"), levels=5)
 
 
 def visible_row(msg, ob):
