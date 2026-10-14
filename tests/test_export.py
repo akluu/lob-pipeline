@@ -1,6 +1,8 @@
+import json
 import os
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -16,7 +18,9 @@ DAYS = ["2025-10-02", "2025-10-03"]
 DAY = DAYS[0]
 
 
-def write_lob(root):
+def write_lob(root, statuses=None):
+    """Spark-style output for instrument 7 on each day: data rows, a status row, _status.json."""
+    statuses = statuses or {day: "ok" for day in DAYS}
     frames = {}
     for seed, day in enumerate(DAYS, start=11):
         s = random_stream(seed, n_events=600)
@@ -25,11 +29,17 @@ def write_lob(root):
         book.finish()
         out = output_frame(rows, 5)
         out.insert(0, "instrument_id", np.int32(7))
-        shuffled = out.sample(frac=1.0, random_state=0)  # parquet readers give no row order
+        end = out.iloc[:1].copy()
+        end.loc[:, out.columns[1:]] = 0
+        stored = pd.concat([out.assign(status=None, input_rows=None),
+                            end.assign(status=statuses[day], input_rows=len(s.rows))], ignore_index=True)
+        shuffled = stored.sample(frac=1.0, random_state=0)  # parquet readers give no row order
         os.makedirs(root / f"date={day}")
         pq.write_table(pa.Table.from_pandas(shuffled, preserve_index=False), root / f"date={day}" / "part-0.parquet")
         frames[day] = out
     (root / "_SUCCESS").touch()
+    (root / "_status.json").write_text(json.dumps([{"date": d, "instrument_id": 7, "status": st}
+                                                   for d, st in statuses.items()]))
     return frames
 
 
@@ -92,6 +102,24 @@ def test_refuses_unfinished_spark_output(tmp_path):
     os.makedirs(tmp_path / "lob" / f"date={DAY}")
     with pytest.raises(FileNotFoundError, match="_SUCCESS"):
         export(str(tmp_path / "lob"), [DAY], str(tmp_path / "csv"))
+
+
+def test_only_days_rebuilt_successfully_are_exported(tmp_path):
+    write_lob(tmp_path / "lob", statuses={DAYS[0]: "ok", DAYS[1]: "row 9: cancel for unknown order 5"})
+    src = str(tmp_path / "lob")
+    with pytest.raises(ValueError, match="rebuilt instruments \\[\\]"):
+        export(src, DAYS, str(tmp_path / "csv"), levels=5)
+    with pytest.raises(ValueError, match="not rebuilt successfully"):
+        export(src, [DAYS[1]], str(tmp_path / "csv"), levels=5, instrument_id=7)
+    assert export(src, [DAYS[0]], str(tmp_path / "csv"), levels=5, instrument_id=7)[DAYS[0]] > 500
+    listed_twice = json.loads((tmp_path / "lob" / "_status.json").read_text())
+    listed_twice.append({"date": DAYS[0], "instrument_id": 7, "status": "row 3: unknown order"})
+    (tmp_path / "lob" / "_status.json").write_text(json.dumps(listed_twice))
+    with pytest.raises(ValueError, match="more than once"):
+        export(src, [DAYS[0]], str(tmp_path / "csv2"), levels=5)
+    os.remove(tmp_path / "lob" / "_status.json")
+    with pytest.raises(FileNotFoundError, match="_status.json"):
+        export(src, [DAYS[0]], str(tmp_path / "csv2"), levels=5)
 
 
 def visible_row(msg, ob):

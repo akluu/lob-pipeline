@@ -9,7 +9,7 @@ import pytest
 
 from lobpipe.book import F_LAST, F_SNAPSHOT, Book
 from lobpipe.ingest import SCHEMA
-from lobpipe.spark_job import build
+from lobpipe.spark_job import run
 from lobpipe.transform import et_midnight_ns
 from scripts import check_snapshots, compare_spark
 from tests.streams import OUT, Stream, random_stream
@@ -88,6 +88,19 @@ def test_instrument_change_is_skipped_not_passed(tmp_path, monkeypatch, capsys):
     assert "0 of 0 day boundaries identical, 2 skipped" in capsys.readouterr().out
 
 
+def test_opening_event_is_found_by_row_number_not_file_name(tmp_path, monkeypatch, capsys):
+    day1 = random_stream(1, n_events=300)
+    write_mbo(str(tmp_path), [(DAY1, 7, day1.rows), (DAY2, 7, next_day(closing_book(day1)))])
+    # split day 2 so the file with the snapshot sorts last by name
+    folder = os.path.join(str(tmp_path), f"date={DAY2}")
+    table = pq.read_table(os.path.join(folder, "part-000.parquet"))
+    os.remove(os.path.join(folder, "part-000.parquet"))
+    pq.write_table(table.slice(0, 5), os.path.join(folder, "part-zzz.parquet"))
+    pq.write_table(table.slice(5), os.path.join(folder, "part-aaa.parquet"))
+    assert run_main(check_snapshots, ["--mbo", str(tmp_path)], monkeypatch) == 0
+    assert "1 of 1 day boundaries identical" in capsys.readouterr().out
+
+
 def test_missing_day_fails_even_against_an_empty_snapshot(tmp_path, monkeypatch, capsys):
     empty = [(0, OUT, OUT, "R", "N", 0, 2**63 - 1, 0, F_SNAPSHOT | F_LAST)]
     write_mbo(str(tmp_path), [(DAY1, 7, []), (DAY2, 7, empty)])
@@ -100,7 +113,7 @@ def spark_output(spark, tmp_path_factory):
     root = str(tmp_path_factory.mktemp("cmp"))
     mbo, lob = os.path.join(root, "mbo"), os.path.join(root, "lob")
     write_dataset(mbo)
-    build(spark, mbo, levels=10, partitions=3).write.partitionBy("date").parquet(lob)
+    run(spark, mbo, lob, partitions=3)
     return mbo, lob
 
 
@@ -126,11 +139,16 @@ def test_spark_output_matches(spark_output, monkeypatch, capsys):
     assert "2 of 2 dates identical" in capsys.readouterr().out
 
 
+def first_data_row(df):
+    return df.index == df.index[df["status"].isna()][0]
+
+
 @pytest.mark.parametrize("edit", [
     lambda df: df.assign(instrument_id=df["instrument_id"].where(df["instrument_id"] != 9, 8)),
-    lambda df: pd.concat([df, df.iloc[:1]], ignore_index=True),
-    lambda df: df.assign(bid_size_1=df["bid_size_1"] + (df.index == 0)),
-], ids=["instrument", "duplicate", "value"])
+    lambda df: pd.concat([df, df[first_data_row(df)]], ignore_index=True),
+    lambda df: df.assign(bid_size_1=df["bid_size_1"] + first_data_row(df)),
+    lambda df: pd.concat([df, df[first_data_row(df)].assign(instrument_id=999)], ignore_index=True),
+], ids=["instrument", "duplicate", "value", "unlisted instrument"])
 def test_spark_output_problems_fail(spark_output, tmp_path, monkeypatch, edit):
     mbo, lob = copy_of(spark_output, tmp_path)
     rewrite_spark_files(lob, DAY2, edit)
@@ -139,12 +157,41 @@ def test_spark_output_problems_fail(spark_output, tmp_path, monkeypatch, edit):
 
 def test_fractional_value_is_not_rounded_away(spark_output, tmp_path, monkeypatch):
     mbo, lob = copy_of(spark_output, tmp_path)
-    rewrite_spark_files(lob, DAY2, lambda df: df.assign(ask_size_1=df["ask_size_1"] + 0.5 * (df.index == 0)))
+    rewrite_spark_files(lob, DAY2, lambda df: df.assign(ask_size_1=df["ask_size_1"] + 0.5 * first_data_row(df)))
     with pytest.raises(ValueError, match="ask_size_1"):
         run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch)
 
 
-def test_unfinished_spark_output_fails(spark_output, tmp_path, monkeypatch):
+@pytest.mark.parametrize("marker", ["_SUCCESS", "_status.json"])
+def test_unfinished_spark_output_fails(spark_output, tmp_path, monkeypatch, marker):
     mbo, lob = copy_of(spark_output, tmp_path)
-    os.remove(os.path.join(lob, "_SUCCESS"))
+    os.remove(os.path.join(lob, marker))
     assert run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch) != 0
+
+
+def test_status_listed_twice_is_rejected(spark_output, tmp_path, monkeypatch):
+    mbo, lob = copy_of(spark_output, tmp_path)
+    with open(os.path.join(lob, "_status.json")) as f:
+        statuses = json.load(f)
+    statuses.append(dict(statuses[0], status="row 1: failed after all"))
+    with open(os.path.join(lob, "_status.json"), "w") as f:
+        json.dump(statuses, f)
+    with pytest.raises(ValueError, match="more than once"):
+        run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch)
+
+
+def test_a_day_that_fails_in_both_is_not_a_difference(spark, tmp_path, monkeypatch, capsys):
+    mbo, lob = str(tmp_path / "mbo"), str(tmp_path / "lob")
+    write_dataset(mbo, broken=(DAY2, 9))
+    run(spark, mbo, lob, partitions=3)
+    assert run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch) == 0
+    assert "1 failed in both" in capsys.readouterr().out
+    # a status that disagrees with the direct rebuild is a difference
+    with open(os.path.join(lob, "_status.json")) as f:
+        statuses = json.load(f)
+    for st in statuses:
+        if (st["date"], st["instrument_id"]) == (DAY2, 7):
+            st["status"] = "row 1: something else"
+    with open(os.path.join(lob, "_status.json"), "w") as f:
+        json.dump(statuses, f)
+    assert run_main(compare_spark, ["--mbo", mbo, "--lob", lob], monkeypatch) == 1

@@ -1,9 +1,11 @@
 """Check that the Spark output equals a plain single-process rebuild, day by day.
 
 For each date the MBO rows are replayed through one Book per instrument in a normal
-Python process. The Spark output for the same date is read back and sorted by
-(instrument_id, row_nr, sub). The two must have the same keys in the same order and the
-same values in every row (compared through a hash of each row).
+Python process. Every instrument-day must end the same way in both (rebuilt, or failed
+with the same error). For the ones rebuilt, the Spark rows read back and sorted by
+(instrument_id, row_nr, sub) must have the same keys in the same order and the same
+values in every row (compared through a hash of each row). On a large dataset, run it
+on a sample with --dates.
 
 usage: python scripts/compare_spark.py --mbo data/mbo --lob data/lob [--dates D ...] [--workers 1]
 """
@@ -11,14 +13,18 @@ usage: python scripts/compare_spark.py --mbo data/mbo --lob data/lob [--dates D 
 import argparse
 import os
 import sys
+from collections import defaultdict
 from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lobpipe.book import COLUMNS, Book, book_columns  # noqa: E402
+from lobpipe.book import COLUMNS, Book, BookError, book_columns  # noqa: E402
+from lobpipe.fs import exists, join, list_dates, resolve  # noqa: E402
+from lobpipe.spark_job import OK, read_statuses  # noqa: E402
 from lobpipe.transform import rebuild_chunks  # noqa: E402
 
 VALUES = COLUMNS + book_columns(10)
@@ -32,9 +38,9 @@ def row_hashes(df):
     return pd.util.hash_pandas_object(df[VALUES].astype("int64"), index=False).to_numpy()
 
 
-def key_array(iid, df):
-    return np.column_stack([np.full(len(df), iid, dtype=np.int64), df["row_nr"].to_numpy(np.int64),
-                            df["sub"].to_numpy(np.int64)])
+def key_array(iids, df):
+    return np.column_stack([np.broadcast_to(np.asarray(iids, dtype=np.int64), len(df)),
+                            df["row_nr"].to_numpy(np.int64), df["sub"].to_numpy(np.int64)])
 
 
 def stack(keys, hashes):
@@ -44,60 +50,74 @@ def stack(keys, hashes):
 
 
 def direct_rows(mbo, day):
-    rows = pq.read_table(os.path.join(mbo, f"date={day}"), columns=INPUT).to_pandas()
+    """Keys and row hashes of the instrument-days rebuilt, and {instrument_id: status}."""
+    fs, path = resolve(join(mbo, f"date={day}"))
+    rows = pq.read_table(path, filesystem=fs, columns=INPUT).to_pandas()
     rows = rows.sort_values(["instrument_id", "row_nr"], kind="stable", ignore_index=True)
-    keys, hashes = [], []
+    keys, hashes, statuses = [], [], {}
     for iid, group in rows.groupby("instrument_id", sort=True):
-        book = Book(levels=10)
-        for frame in rebuild_chunks(book, group, day):
-            keys.append(key_array(iid, frame))
-            hashes.append(row_hashes(frame))
-        book.finish()
-    return stack(keys, hashes)
+        book, k, h = Book(levels=10), [], []
+        try:
+            for frame in rebuild_chunks(book, group, day):
+                k.append(key_array(iid, frame))
+                h.append(row_hashes(frame))
+            book.finish()
+        except BookError as e:
+            statuses[int(iid)] = str(e)
+            continue
+        statuses[int(iid)] = OK
+        keys += k
+        hashes += h
+    return *stack(keys, hashes), statuses
 
 
-def spark_rows(lob, day):
-    folder = os.path.join(lob, f"date={day}")
-    keys, hashes = [], []
-    if os.path.isdir(folder):
-        for name in sorted(f for f in os.listdir(folder) if f.endswith(".parquet")):
-            for batch in pq.ParquetFile(os.path.join(folder, name)).iter_batches(batch_size=500_000):
+def spark_rows(lob, day, instruments, known):
+    """Keys and row hashes of the Spark data rows of `instruments`, sorted by key, and the
+    number of rows whose instrument has no status at all on that day."""
+    fs, path = resolve(join(lob, f"date={day}"))
+    keys, hashes, unknown = [], [], 0
+    if fs.get_file_info(path).type == pafs.FileType.Directory:
+        files = sorted(i.path for i in fs.get_file_info(pafs.FileSelector(path)) if i.path.endswith(".parquet"))
+        for name in files:
+            for batch in pq.ParquetFile(fs.open_input_file(name)).iter_batches(batch_size=500_000):
                 frame = batch.to_pandas()
-                keys.append(np.column_stack([frame["instrument_id"].to_numpy(np.int64), frame["row_nr"].to_numpy(),
-                                             frame["sub"].to_numpy()]))
+                unknown += int((~frame["instrument_id"].isin(known)).sum())
+                frame = frame[frame["status"].isna() & frame["instrument_id"].isin(instruments)]
+                keys.append(key_array(frame["instrument_id"].to_numpy(), frame))
                 hashes.append(row_hashes(frame))
     keys, hashes = stack(keys, hashes)
     # Spark writes files in no particular order
     order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
-    return keys[order], hashes[order]
+    return keys[order], hashes[order], unknown
 
 
 def compare_day(args):
-    mbo, lob, day = args
-    direct_keys, direct = direct_rows(mbo, day)
-    spark_keys, spark = spark_rows(lob, day)
+    mbo, lob, day, spark_status = args
+    direct_keys, direct, direct_status = direct_rows(mbo, day)
+    rebuilt = [iid for iid, status in direct_status.items() if status == OK]
+    spark_keys, spark, unknown = spark_rows(lob, day, rebuilt, list(spark_status))
     duplicates = bool((np.diff(spark_keys, axis=0) == 0).all(axis=1).any())
-    same = (not duplicates and len(direct) == len(spark) and bool((direct_keys == spark_keys).all())
-            and bool((direct == spark).all()))
-    return day, len(direct), len(spark), duplicates, same
+    same = (direct_status == spark_status and not unknown and not duplicates and len(direct) == len(spark)
+            and bool((direct_keys == spark_keys).all()) and bool((direct == spark).all()))
+    return day, len(direct), len(spark), len(direct_status) - len(rebuilt), duplicates, same
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--mbo", required=True, help="MBO parquet written by lobpipe.ingest")
+    p.add_argument("--mbo", required=True, help="MBO dataset written by lobpipe.ingest")
     p.add_argument("--lob", required=True, help="output of lobpipe.spark_job")
     p.add_argument("--dates", nargs="*", help="default: every date in --mbo")
     p.add_argument("--workers", type=int, default=1, help="days compared at once; each holds a whole day in memory")
     args = p.parse_args()
-    if not os.path.exists(os.path.join(args.lob, "_SUCCESS")):
-        sys.exit(f"{args.lob} has no _SUCCESS marker; the Spark job did not finish")
+    if not exists(join(args.lob, "_SUCCESS")) or not exists(join(args.lob, "_status.json")):
+        sys.exit(f"{args.lob} has no _SUCCESS or _status.json; the Spark job did not finish")
+    spark_status = defaultdict(dict)
+    for (iid, day), status in read_statuses(args.lob).items():
+        spark_status[day][iid] = status
 
-    def dates_in(root):
-        return sorted(d.split("=", 1)[1] for d in os.listdir(root) if d.startswith("date="))
-
-    dates = args.dates or dates_in(args.mbo)
-    extra = sorted(set(dates_in(args.lob)) - set(dates_in(args.mbo)))
-    jobs = [(args.mbo, args.lob, d) for d in dates]
+    dates = args.dates or list_dates(args.mbo)
+    extra = sorted(set(list_dates(args.lob)) - set(list_dates(args.mbo)))
+    jobs = [(args.mbo, args.lob, d, spark_status[d]) for d in dates]
     if args.workers > 1:
         with Pool(args.workers) as pool:
             results = pool.map(compare_day, jobs, chunksize=1)
@@ -105,9 +125,10 @@ def main():
         results = [compare_day(job) for job in jobs]
 
     bad = 0
-    for day, n_direct, n_spark, duplicates, same in results:
+    for day, n_direct, n_spark, failed, duplicates, same in results:
         note = "identical" if same else "DUPLICATE KEYS" if duplicates else "DIFFERENT"
-        print(f"{day}: direct {n_direct:>11,} rows, spark {n_spark:>11,} rows  {note}")
+        failed = f", {failed} failed in both" if failed and same else ""
+        print(f"{day}: direct {n_direct:>11,} rows, spark {n_spark:>11,} rows  {note}{failed}")
         bad += not same
     for day in extra:
         print(f"{day}: in the Spark output but not in the MBO input")

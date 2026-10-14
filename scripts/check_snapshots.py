@@ -4,50 +4,41 @@ Every date in the MBO data opens with a book snapshot: a reset followed by one a
 resting order. If the rebuild is right, the book left at the end of day D must equal,
 order for order (side, price, size), the snapshot that opens day D+1. This compares every
 pair of consecutive calendar dates, for each instrument the ingest manifest lists on both
-days. There is no Saturday data, so the Friday -> Sunday gap is never compared.
+days. There is no Saturday data, so the Friday -> Sunday gap is never compared. On a large
+dataset, run it on a sample with --dates (each date is compared with the day after it).
 
-usage: python scripts/check_snapshots.py --mbo data/mbo [--workers 1]
+usage: python scripts/check_snapshots.py --mbo data/mbo [--dates D ...] [--workers 1]
 """
 
 import argparse
-import json
 import os
 import sys
 from datetime import date, timedelta
 from multiprocessing import Pool
 
 import numpy as np
-import pandas as pd
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lobpipe.book import F_LAST, Book, BookError  # noqa: E402
+from lobpipe.fs import join, read_json, resolve  # noqa: E402
 from lobpipe.transform import rebuild_chunks  # noqa: E402
 
 COLUMNS = ["row_nr", "ts_event", "instrument_id", "action", "side", "order_id", "price", "size", "flags"]
 
 
 def load(mbo, day, iid):
-    """Every row of one instrument on one day, in file order."""
-    table = pq.read_table(os.path.join(mbo, f"date={day}"), columns=COLUMNS, filters=[("instrument_id", "=", iid)])
+    """Every row of one instrument on one day, in file order (row_nr)."""
+    fs, path = resolve(join(mbo, f"date={day}"))
+    table = pq.read_table(path, filesystem=fs, columns=COLUMNS, filters=[("instrument_id", "=", iid)])
     return table.to_pandas().sort_values("row_nr", kind="stable", ignore_index=True)
 
 
 def opening_event(mbo, day, iid):
     """Rows of one instrument on one day up to and including its first F_LAST record."""
-    folder = os.path.join(mbo, f"date={day}")
-    parts = []
-    # part files are numbered in input file order, so reading them in name order keeps row order
-    for name in sorted(f for f in os.listdir(folder) if f.endswith(".parquet")):
-        for batch in pq.ParquetFile(os.path.join(folder, name)).iter_batches(batch_size=100_000, columns=COLUMNS):
-            rows = batch.to_pandas()
-            rows = rows[rows["instrument_id"] == iid]
-            ends = (rows["flags"].to_numpy() & F_LAST).nonzero()[0]
-            if len(ends):
-                parts.append(rows.iloc[:int(ends[0]) + 1])
-                return pd.concat(parts, ignore_index=True)
-            parts.append(rows)
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=COLUMNS)
+    rows = load(mbo, day, iid)
+    ends = (rows["flags"].to_numpy() & F_LAST).nonzero()[0]
+    return rows.iloc[:int(ends[0]) + 1] if len(ends) else rows
 
 
 def run(book, rows, day):
@@ -80,14 +71,16 @@ def compare_pair(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mbo", required=True, help="MBO parquet written by lobpipe.ingest")
+    p.add_argument("--dates", nargs="*", help="default: every date in --mbo")
     p.add_argument("--workers", type=int, default=1, help="days compared at once; each holds a whole day in memory")
     args = p.parse_args()
-    with open(os.path.join(args.mbo, "_manifest.json")) as f:
-        manifest = json.load(f)
+    manifest = read_json(join(args.mbo, "_manifest.json"))
     instruments = {day: {int(i) for i in v["instruments"]} for day, v in manifest["dates"].items()}
 
     pairs, skipped = [], []
-    for day in sorted(instruments):
+    for day in sorted(args.dates or instruments):
+        if day not in instruments:
+            sys.exit(f"{day} is not in {args.mbo}")
         nxt = str(date.fromisoformat(day) + timedelta(days=1))
         if nxt not in instruments:
             continue

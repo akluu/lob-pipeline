@@ -5,9 +5,11 @@ No header row. Message columns: time (seconds after midnight, New York time, 9 d
 event type, order id, size, price (dollars x 10000), direction. Orderbook columns:
 ask price 1, ask size 1, bid price 1, bid size 1, ... for each level.
 
-Only a Spark output with a _SUCCESS marker is read. All requested days are written to
-<out>.partial and published with a single directory rename, so a reader never sees a
-half-written file or a message file without its orderbook.
+Only a finished Spark output (_SUCCESS and _status.json) is read, which can be local or on
+S3, and only instrument-days whose rebuild succeeded are written. The CSV files go to a
+local folder: all requested days are written to <out>.partial and published with a single
+directory rename, so a reader never sees a half-written file or a message file without
+its orderbook.
 """
 
 import argparse
@@ -16,10 +18,14 @@ import shutil
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.csv as pacsv
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from lobpipe.book import book_columns
+from lobpipe.fs import join, resolve
+from lobpipe.spark_job import ok_days
 
 MESSAGE_COLUMNS = ["type", "order_id", "size", "price", "direction"]
 
@@ -35,16 +41,19 @@ def file_names(ticker, day, levels, window=(34_200_000, 57_600_000)):
     return f"{stem}_message_{levels}.csv", f"{stem}_orderbook_{levels}.csv"
 
 
-def export_day(src, day, out_dir, ticker="ES", levels=10, instrument_id=None):
-    """Write one day's CSV pair into out_dir (used by export(), which stages and publishes)."""
-    table = pq.read_table(os.path.join(src, f"date={day}"))
-    df = table.to_pandas()
+def export_day(src, day, out_dir, ticker="ES", levels=10, instrument_id=None, ok=None):
+    """Write one instrument-day's CSV pair into out_dir (export() stages and publishes)."""
+    ok = ok_days(src) if ok is None else ok
     if instrument_id is None:
-        ids = df["instrument_id"].unique()
-        if len(ids) != 1:
-            raise ValueError(f"{day} has several instruments {list(ids)}; pass instrument_id")
-    else:
-        df = df[df["instrument_id"] == instrument_id]
+        passed = sorted(iid for iid, d in ok if d == day)
+        if len(passed) != 1:
+            raise ValueError(f"{day}: rebuilt instruments {passed}; pass the instrument id to export")
+        instrument_id = passed[0]
+    elif (instrument_id, day) not in ok:
+        raise ValueError(f"{day} instrument {instrument_id} was not rebuilt successfully, see _status.json")
+    fs, path = resolve(join(src, f"date={day}"))
+    table = pq.read_table(path, filesystem=fs, filters=[("instrument_id", "=", instrument_id)])
+    df = table.filter(pc.is_null(table["status"])).to_pandas()  # leave out the status row
     df = df.sort_values(["row_nr", "sub"], kind="stable")
     if df.duplicated(["row_nr", "sub"]).any():
         raise ValueError(f"{day}: duplicate (row_nr, sub) keys")
@@ -59,17 +68,19 @@ def export_day(src, day, out_dir, ticker="ES", levels=10, instrument_id=None):
     return len(df)
 
 
-def export(src, dates, out_dir, ticker="ES", levels=10, overwrite=False):
+def export(src, dates, out_dir, ticker="ES", levels=10, overwrite=False, instrument_id=None):
     """Write the CSV pairs for all dates and publish them together as out_dir."""
     out_dir = out_dir.rstrip("/")
-    if not os.path.exists(os.path.join(src, "_SUCCESS")):
+    fs, path = resolve(src)
+    if fs.get_file_info(join(path, "_SUCCESS")).type == pafs.FileType.NotFound:
         raise FileNotFoundError(f"{src} has no _SUCCESS marker; the Spark job did not finish")
+    ok = ok_days(src)
     if os.path.exists(out_dir) and not overwrite:
         raise FileExistsError(f"{out_dir} exists (use --overwrite)")
     tmp = out_dir + ".partial"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
-    counts = {day: export_day(src, day, tmp, ticker, levels) for day in dates}
+    counts = {day: export_day(src, day, tmp, ticker, levels, instrument_id, ok) for day in dates}
     if os.path.exists(out_dir):
         old = out_dir + ".old"
         shutil.rmtree(old, ignore_errors=True)
@@ -83,14 +94,15 @@ def export(src, dates, out_dir, ticker="ES", levels=10, overwrite=False):
 
 def main():
     p = argparse.ArgumentParser(description="Write LOBSTER CSV pairs from the Spark output.")
-    p.add_argument("--src", required=True, help="parquet dataset written by lobpipe.spark_job")
-    p.add_argument("--out", required=True, help="directory for the CSV files")
+    p.add_argument("--src", required=True, help="dataset written by lobpipe.spark_job (folder or s3://)")
+    p.add_argument("--out", required=True, help="local directory for the CSV files")
     p.add_argument("--dates", nargs="+", required=True)
     p.add_argument("--ticker", default="ES")
+    p.add_argument("--instrument", type=int, help="instrument id, needed when a day has more than one")
     p.add_argument("--levels", type=int, default=10)
     p.add_argument("--overwrite", action="store_true", help="replace an existing output directory")
     args = p.parse_args()
-    counts = export(args.src, args.dates, args.out, args.ticker, args.levels, args.overwrite)
+    counts = export(args.src, args.dates, args.out, args.ticker, args.levels, args.overwrite, args.instrument)
     for day, n in counts.items():
         print(f"{day}: {n:,} rows")
 
