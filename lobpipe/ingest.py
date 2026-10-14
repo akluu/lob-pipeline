@@ -23,6 +23,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.pandas.types import from_arrow_schema
 
 from lobpipe.fs import exists, for_spark, join, resolve, write_json
+from lobpipe.spark import session
 
 DAY_NS = 86_400 * 10**9
 CHUNK = 1_000_000
@@ -155,8 +156,6 @@ def ingest(spark, inputs, out, overwrite=False, chunk=CHUNK):
 
 
 def main():
-    from lobpipe.spark_job import session
-
     p = argparse.ArgumentParser(description="Convert Databento MBO files to a date-partitioned Parquet dataset.")
     p.add_argument("--out", required=True, help="output folder or s3:// URI")
     p.add_argument("--overwrite", action="store_true", help="replace an existing output")

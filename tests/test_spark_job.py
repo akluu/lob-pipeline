@@ -150,7 +150,7 @@ def test_spark_submit_settings_are_kept(tmp_path):
 
     script = tmp_path / "job.py"
     script.write_text("import os\n"
-                      "from lobpipe.spark_job import session\n"
+                      "from lobpipe.spark import session\n"
                       "s = session(master='local[3]', driver_memory='3g')\n"
                       "print('MASTER', s.sparkContext.master)\n"
                       "print('MEMORY', s.sparkContext.getConf().get('spark.driver.memory', 'unset'))\n"

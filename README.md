@@ -124,7 +124,7 @@ only and stops that day if the two disagree after any event.
   This command was run with a local master and local files only (no S3 jars), not on a
   multi-node cluster.
 - **Memory.** A Spark task's memory depends on the live orders of one day and the Arrow
-  batch size (`--batch`), not on the size of the dataset. Export holds one
+  batch size, not on the size of the dataset. Export holds one
   instrument-day in memory: 3.3 GB at peak for a day of 3.8 million rows.
 - **What it covers.** ES outright contracts. A calendar spread trades at zero or below
   on some days; those days are reported as failed, since LOBSTER prices must be

@@ -5,7 +5,7 @@ import pytest
 
 @pytest.fixture(scope="session")
 def spark():
-    from lobpipe.spark_job import session
+    from lobpipe.spark import session
 
     # start the way the job does, with nothing set in the environment
     os.environ.pop("PYSPARK_PYTHON", None)

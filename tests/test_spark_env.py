@@ -1,7 +1,7 @@
 import os
 import sys
 
-from lobpipe.spark_job import session
+from lobpipe.spark import session
 
 
 def test_spark_map_in_pandas(spark):
