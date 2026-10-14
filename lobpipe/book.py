@@ -1,27 +1,12 @@
-"""Order book rebuild for one instrument-day and translation to LOBSTER events.
+"""Order book for one instrument-day, written out as LOBSTER events.
 
-Records are processed in file order and grouped into events (records up to and
-including the next one with F_LAST set). A trade summary (T) opens a trade group made
-of the T and the fills (F) right after it.
+Records are grouped into events (up to and including the next record with F_LAST). Two
+views of the book are kept: `orders`, the exchange's book changed only by add, cancel,
+modify and reset records, and `depth`, the published book, which also takes off fills as
+soon as they happen. Both must agree at the end of every event. Anything the rules below
+don't explain raises BookError instead of being guessed at.
 
-Two views of the book are kept:
-  orders  - the exchange's own book, changed only by A/C/M/R records
-  depth   - the published book: orders minus passive fills that the exchange has
-            reported but not yet confirmed with the order's C/M record
-
-At the end of every event both views must agree; with verify=True a second depth
-table built only from A/C/M/R is kept and compared after every event. Any record
-sequence not covered by the rules below raises BookError instead of being guessed at.
-
-LOBSTER event types written:
-  1 new order, 2 partial cancel, 3 delete, 4 visible execution,
-  5 execution against quantity that was never displayed (depth unchanged): the part
-    of a fill beyond an order's displayed size (iceberg reserve), or a fill against the
-    remainder of an aggressor from earlier in the same event that was never added
-Fills of the aggressing order itself are not written: LOBSTER records executions on
-the resting side. A modify that changes price or increases size is written as a
-delete followed by a new order with the same order id. Auction fills (side N) are
-only allowed outside the export window and are not written.
+A record is a tuple (row_nr, ts_event, time_ns, action, side, order_id, price, size, flags).
 """
 
 from bisect import bisect_left, insort
@@ -38,10 +23,7 @@ COLUMNS = ["row_nr", "sub", "ts_event", "time_ns", "type", "order_id", "size", "
 
 
 def book_columns(levels):
-    cols = []
-    for i in range(1, levels + 1):
-        cols += [f"ask_price_{i}", f"ask_size_{i}", f"bid_price_{i}", f"bid_size_{i}"]
-    return cols
+    return [f"{name}_{i}" for i in range(1, levels + 1) for name in ("ask_price", "ask_size", "bid_price", "bid_size")]
 
 
 class BookError(Exception):
@@ -51,27 +33,23 @@ class BookError(Exception):
 class Book:
     def __init__(self, levels=10, window=(34_200 * 10**9, 57_600 * 10**9), verify=False):
         self.levels = levels
-        self.verify = verify
-        self.native = {"B": {}, "A": {}}  # depth from A/C/M/R only, kept when verify=True
-        self.lo, self.hi = window
+        self.lo, self.hi = window  # only events in [lo, hi) nanoseconds after midnight are written
+        self.verify = verify  # also keep depth built from add/cancel/modify only, and compare
         self.orders = {}  # order_id -> [side, price, size]
-        self.pending = {}  # order_id -> visible quantity filled, waiting for its C/M
-        self.depth = {"B": {}, "A": {}}  # price -> displayed quantity
+        self.pending = {}  # order_id -> filled quantity not yet confirmed by its cancel/modify
+        self.depth = {"B": {}, "A": {}}  # price -> displayed size
         self.prices = {"B": [], "A": []}  # sorted ascending
+        self.native = {"B": {}, "A": {}}
         self.initialized = False
-        self.max_time = None  # latest time_ns seen outside a reset; never moves backwards
-        self.unshown = {}  # aggressors earlier in this event that were never in the book -> (side, price)
-        self.event = []  # records of the open event
+        self.max_time = None
+        self.unshown = {}  # aggressors earlier in this event that never rested -> (side, price)
+        self.event = []
         self.out = []
-        self.stats = {}
 
-    # ---- input -------------------------------------------------------------
-
-    def feed(self, rows):
-        """rows: iterable of tuples (row_nr, ts_event, time_ns, action, side, order_id, price, size, flags)."""
-        for r in rows:
-            self.event.append(r)
-            if r[8] & F_LAST:
+    def feed(self, records):
+        for rec in records:
+            self.event.append(rec)
+            if rec[8] & F_LAST:
                 self._run_event(self.event)
                 self.event = []
         out, self.out = self.out, []
@@ -81,289 +59,246 @@ class Book:
         if self.event:
             raise BookError(f"input ended inside an event starting at row {self.event[0][0]}")
 
-    # ---- published depth ---------------------------------------------------
-
-    def _change(self, side, price, qty):
-        if price <= 0 or price % PRICE_SCALE:
-            # calendar spreads can trade at zero or below; LOBSTER prices can't
-            raise BookError(f"price {price} is not a positive whole LOBSTER price")
-        levels = self.depth[side]
-        new = levels.get(price, 0) + qty
-        if new < 0:
-            raise BookError(f"negative depth {side} {price}")
-        if new == 0:
-            if price in levels:
-                del levels[price]
-                prices = self.prices[side]
-                del prices[bisect_left(prices, price)]
-        else:
-            if price not in levels:
-                insort(self.prices[side], price)
-            levels[price] = new
-
     def top(self):
         asks, bids = self.prices["A"], self.prices["B"]
-        ad, bd = self.depth["A"], self.depth["B"]
         row = []
         for i in range(self.levels):
             if i < len(asks):
-                p = asks[i]
-                row += [p // PRICE_SCALE, ad[p]]
+                row += [asks[i] // PRICE_SCALE, self.depth["A"][asks[i]]]
             else:
                 row += [EMPTY_ASK, 0]
             if i < len(bids):
-                p = bids[-1 - i]
-                row += [p // PRICE_SCALE, bd[p]]
+                price = bids[-1 - i]  # bids are sorted ascending, best last
+                row += [price // PRICE_SCALE, self.depth["B"][price]]
             else:
                 row += [EMPTY_BID, 0]
         return row
 
-    def best(self):
-        bid = self.prices["B"][-1] if self.prices["B"] else None
-        ask = self.prices["A"][0] if self.prices["A"] else None
-        return bid, ask
-
-    def _emit(self, r, sub, kind, oid, size, price, side):
-        if self.lo <= r[2] < self.hi:
-            if price % PRICE_SCALE:
-                raise BookError(f"row {r[0]}: price {price} is not a whole LOBSTER price")
-            self.out.append((r[0], sub, r[1], r[2], kind, oid, size, price // PRICE_SCALE, DIRECTION[side])
-                            + tuple(self.top()))
-
-    def check(self):
-        """Published depth must equal the order book once all fills are confirmed."""
-        depth = {"B": {}, "A": {}}
-        for side, price, size in self.orders.values():
-            depth[side][price] = depth[side].get(price, 0) + size
-        if self.pending or depth != self.depth or any(sorted(depth[s]) != self.prices[s] for s in depth):
-            raise BookError("published depth is out of sync with the order book")
+    def _change(self, side, price, qty):
+        if price <= 0 or price % PRICE_SCALE:
+            raise BookError(f"price {price} is not a positive whole LOBSTER price")  # e.g. a calendar spread
+        levels, size = self.depth[side], self.depth[side].get(price, 0) + qty
+        if size < 0:
+            raise BookError(f"negative depth {side} {price}")
+        if size == 0 and price in levels:
+            del levels[price]
+            del self.prices[side][bisect_left(self.prices[side], price)]
+        elif size:
+            if price not in levels:
+                insort(self.prices[side], price)
+            levels[price] = size
 
     def _native(self, side, price, qty):
-        levels = self.native[side]
-        new = levels.get(price, 0) + qty
-        if new:
-            levels[price] = new
+        size = self.native[side].get(price, 0) + qty
+        if size:
+            self.native[side][price] = size
         else:
-            levels.pop(price, None)
+            self.native[side].pop(price, None)
 
-    def _count(self, key):
-        self.stats[key] = self.stats.get(key, 0) + 1
+    def _emit(self, rec, sub, kind, oid, size, price, side):
+        if self.lo <= rec[2] < self.hi:
+            if price % PRICE_SCALE:
+                raise BookError(f"row {rec[0]}: price {price} is not a whole LOBSTER price")
+            self.out.append((rec[0], sub, rec[1], rec[2], kind, oid, size, price // PRICE_SCALE, DIRECTION[side])
+                            + tuple(self.top()))
 
-    # ---- events ------------------------------------------------------------
-
-    def _reset(self):
+    def _snapshot(self, event):
+        """A reset (R) followed by snapshot adds; files from before February 2024 have no R."""
+        first = event[0][0]
+        if self.max_time is not None and self.lo <= self.max_time < self.hi:
+            raise BookError(f"row {first}: book reset inside the export window")
+        if self.pending:
+            raise BookError(f"row {first}: book reset with unconfirmed fills")
+        adds = event[1:] if event[0][3] == "R" else event
+        if any(rec[3] != "A" or not rec[8] & F_SNAPSHOT for rec in adds):
+            raise BookError(f"row {first}: malformed snapshot event")
         self.orders.clear()
         self.pending.clear()
-        self.depth = {"B": {}, "A": {}}
-        self.prices = {"B": [], "A": []}
-        self.native = {"B": {}, "A": {}}
-
-    def _snapshot(self, ev):
-        """A reset (R) followed by snapshot adds. Databento files from before February 2024
-        can open a day with the snapshot adds alone, without the reset record."""
-        if self.max_time is not None and self.lo <= self.max_time < self.hi:
-            raise BookError(f"row {ev[0][0]}: book reset inside the export window")
-        if self.pending:
-            raise BookError(f"row {ev[0][0]}: book reset with unconfirmed fills")
-        adds = ev[1:] if ev[0][3] == "R" else ev
-        if any(r[3] != "A" or not r[8] & F_SNAPSHOT for r in adds):
-            raise BookError(f"row {ev[0][0]}: malformed snapshot event")
-        self._reset()
+        self.depth, self.prices, self.native = {"B": {}, "A": {}}, {"B": [], "A": []}, {"B": {}, "A": {}}
         self.initialized = False
-        for r in adds:
-            oid, side = r[5], r[4]
+        for rec in adds:
+            row, side, oid, price, size = rec[0], rec[4], rec[5], rec[6], rec[7]
             if side not in DIRECTION or oid in self.orders:
-                raise BookError(f"row {r[0]}: bad snapshot order {oid} side {side}")
-            self.orders[oid] = [side, r[6], r[7]]
-            self._change(side, r[6], r[7])
+                raise BookError(f"row {row}: bad snapshot order {oid} side {side}")
+            self.orders[oid] = [side, price, size]
+            self._change(side, price, size)
             if self.verify:
-                self._native(side, r[6], r[7])
+                self._native(side, price, size)
         self.initialized = True
-        self._count("snapshot")
 
-    def _run_event(self, ev):
-        if any(r[3] == "R" for r in ev) or (not self.initialized and all(r[8] & F_SNAPSHOT for r in ev)):
-            self._snapshot(ev)
+    def _run_event(self, event):
+        first, last = event[0][0], event[-1][0]
+        if any(rec[3] == "R" for rec in event) or (not self.initialized and all(rec[8] & F_SNAPSHOT for rec in event)):
+            self._snapshot(event)
             return
         if not self.initialized:
-            raise BookError(f"row {ev[0][0]}: event before the book was initialized")
-        if any(r[8] & F_SNAPSHOT for r in ev):
-            raise BookError(f"row {ev[0][0]}: snapshot record outside a reset")
-        t = max(r[2] for r in ev)
-        if self.max_time is None or t > self.max_time:
-            self.max_time = t
-        resting = {r[5] for r in ev if r[3] == "T" and r[5] in self.orders}
+            raise BookError(f"row {first}: event before the book was initialized")
+        if any(rec[8] & F_SNAPSHOT for rec in event):
+            raise BookError(f"row {first}: snapshot record outside a reset")
+        latest = max(rec[2] for rec in event)
+        self.max_time = latest if self.max_time is None else max(self.max_time, latest)
+        resting = {rec[5] for rec in event if rec[3] == "T" and rec[5] in self.orders}
         self.unshown = {}
         group = None
-        for r in ev:
-            act = r[3]
-            if act != "F" and group is not None:
+        for rec in event:
+            action = rec[3]
+            if action != "F" and group is not None:
                 self._close_group(group, resting)
                 group = None
-            if act in ("A", "C", "M"):
-                self.unshown.pop(r[5], None)
-            if act == "A":
-                self._add(r)
-            elif act == "C":
-                self._cancel(r)
-            elif act == "M":
-                self._modify(r)
-            elif act == "T":
-                group = self._trade(r)
-                if r[4] in DIRECTION and r[5] not in self.orders:
-                    self.unshown[r[5]] = (r[4], r[6])
-            elif act == "F":
+            if action in ("A", "C", "M"):
+                self.unshown.pop(rec[5], None)
+            if action == "A":
+                self._add(rec)
+            elif action == "C":
+                self._cancel(rec)
+            elif action == "M":
+                self._modify(rec)
+            elif action == "T":
+                group = self._trade(rec)
+                if rec[4] in DIRECTION and rec[5] not in self.orders:
+                    self.unshown[rec[5]] = (rec[4], rec[6])
+            elif action == "F":
                 if group is None:
-                    raise BookError(f"row {r[0]}: fill without a trade summary")
-                self._fill(r, group)
-            elif act != "N":
-                raise BookError(f"row {r[0]}: unknown action {act}")
+                    raise BookError(f"row {rec[0]}: fill without a trade summary")
+                self._fill(rec, group)
+            elif action != "N":
+                raise BookError(f"row {rec[0]}: unknown action {action}")
         if group is not None:
             self._close_group(group, resting)
         if self.pending:
-            raise BookError(f"row {ev[-1][0]}: fills not confirmed by the end of the event: {self.pending}")
+            raise BookError(f"row {last}: fills not confirmed by the end of the event: {self.pending}")
         if self.verify and self.native != self.depth:
-            raise BookError(f"row {ev[-1][0]}: published depth differs from the order book after the event")
+            raise BookError(f"row {last}: published depth differs from the order book after the event")
 
-    def _add(self, r):
-        oid, side, price, size = r[5], r[4], r[6], r[7]
+    def _add(self, rec):
+        row, side, oid, price, size = rec[0], rec[4], rec[5], rec[6], rec[7]
         if side not in DIRECTION:
-            raise BookError(f"row {r[0]}: add with side {side}")
+            raise BookError(f"row {row}: add with side {side}")
         if oid in self.orders:
-            raise BookError(f"row {r[0]}: add for live order {oid}")
+            raise BookError(f"row {row}: add for live order {oid}")
         self.orders[oid] = [side, price, size]
         self._change(side, price, size)
         if self.verify:
             self._native(side, price, size)
-        self._emit(r, 0, 1, oid, size, price, side)
-        self._count("add")
+        self._emit(rec, 0, 1, oid, size, price, side)
 
-    def _trade(self, r):
-        if r[4] == "N":
-            if self.lo <= r[2] < self.hi:
-                raise BookError(f"row {r[0]}: auction trade inside the export window")
-            bid, ask = self.best()
+    def _trade(self, rec):
+        if rec[4] == "N":  # opening auction: only outside the window, on a crossed book
+            bid = self.prices["B"][-1] if self.prices["B"] else None
+            ask = self.prices["A"][0] if self.prices["A"] else None
+            if self.lo <= rec[2] < self.hi:
+                raise BookError(f"row {rec[0]}: auction trade inside the export window")
             if bid is None or ask is None or bid < ask:
-                raise BookError(f"row {r[0]}: auction trade on an uncrossed book")
-            self._count("auction")
-        return {"t": r, "passive": 0, "aggressor": 0, "fills": 0}
+                raise BookError(f"row {rec[0]}: auction trade on an uncrossed book")
+        return {"trade": rec, "passive": 0, "aggressor": 0, "fills": 0}
 
-    def _fill(self, r, g):
-        t = g["t"]
-        oid, side, price, qty = r[5], r[4], r[6], r[7]
-        g["fills"] += qty
-        if t[4] == "N":
-            if price != t[6]:
-                raise BookError(f"row {r[0]}: auction fill off the auction price")
+    def _fill(self, rec, group):
+        trade = group["trade"]
+        row, side, oid, price, qty = rec[0], rec[4], rec[5], rec[6], rec[7]
+        group["fills"] += qty
+        if trade[4] == "N":
+            if price != trade[6]:
+                raise BookError(f"row {row}: auction fill off the auction price")
             if oid not in self.orders:
                 if side != "N":
-                    raise BookError(f"row {r[0]}: auction fill for unknown order {oid}")
+                    raise BookError(f"row {row}: auction fill for unknown order {oid}")
                 return
-            o = self.orders[oid]
-            if side not in ("N", o[0]):
-                raise BookError(f"row {r[0]}: auction fill on the wrong side")
-            visible = min(qty, o[2] - self.pending.get(oid, 0))
-            self._pend(oid, o, visible)
+            order = self.orders[oid]
+            if side not in ("N", order[0]):
+                raise BookError(f"row {row}: auction fill on the wrong side")
+            self._pend(oid, order, min(qty, order[2] - self.pending.get(oid, 0)))
             return
-        if oid == t[5]:
-            if side != t[4] or price != t[6]:
-                raise BookError(f"row {r[0]}: aggressor fill does not match its trade")
-            g["aggressor"] += qty
+        if oid == trade[5]:
+            if side != trade[4] or price != trade[6]:
+                raise BookError(f"row {row}: aggressor fill does not match its trade")
+            group["aggressor"] += qty
             return
-        o = self.orders.get(oid)
-        if o is None:
-            if self.unshown.get(oid) == (side, price) and side == OPPOSITE[t[4]] and price == t[6]:
-                g["passive"] += qty
-                self._emit(r, 0, 5, oid, qty, price, side)
-                self._count("unshown_remainder_execution")
+        order = self.orders.get(oid)
+        if order is None:
+            # fill against an earlier aggressor's remainder that was never shown in the book
+            if self.unshown.get(oid) == (side, price) and side == OPPOSITE[trade[4]] and price == trade[6]:
+                group["passive"] += qty
+                self._emit(rec, 0, 5, oid, qty, price, side)
                 return
-            raise BookError(f"row {r[0]}: fill for unknown order {oid}")
-        if side != OPPOSITE[t[4]] or o[0] != side:
-            raise BookError(f"row {r[0]}: passive fill on the wrong side")
-        if price != t[6] or o[1] != price:
-            raise BookError(f"row {r[0]}: passive fill price {price} vs trade {t[6]} / order {o[1]}")
-        g["passive"] += qty
-        visible = min(qty, o[2] - self.pending.get(oid, 0))
-        hidden = qty - visible
-        self._pend(oid, o, visible)
+            raise BookError(f"row {row}: fill for unknown order {oid}")
+        if side != OPPOSITE[trade[4]] or order[0] != side:
+            raise BookError(f"row {row}: passive fill on the wrong side")
+        if price != trade[6] or order[1] != price:
+            raise BookError(f"row {row}: passive fill price {price} vs trade {trade[6]} / order {order[1]}")
+        group["passive"] += qty
+        visible = min(qty, order[2] - self.pending.get(oid, 0))
+        self._pend(oid, order, visible)
         if visible:
-            self._emit(r, 0, 4, oid, visible, price, side)
-            self._count("execution")
-        if hidden:
-            self._emit(r, 1, 5, oid, hidden, price, side)
-            self._count("hidden_execution")
+            self._emit(rec, 0, 4, oid, visible, price, side)
+        if qty > visible:  # iceberg reserve
+            self._emit(rec, 1, 5, oid, qty - visible, price, side)
 
-    def _pend(self, oid, o, visible):
+    def _pend(self, oid, order, visible):
         if visible:
             self.pending[oid] = self.pending.get(oid, 0) + visible
-            self._change(o[0], o[1], -visible)
+            self._change(order[0], order[1], -visible)
 
-    def _close_group(self, g, resting):
-        t = g["t"]
-        if t[4] == "N":
-            if g["fills"] != 2 * t[7]:
-                raise BookError(f"row {t[0]}: auction fills {g['fills']} for trade size {t[7]}")
+    def _close_group(self, group, resting):
+        trade = group["trade"]
+        row, size = trade[0], trade[7]
+        if trade[4] == "N":
+            if group["fills"] != 2 * size:
+                raise BookError(f"row {row}: auction fills {group['fills']} for trade size {size}")
             return
-        if g["passive"] != t[7]:
-            raise BookError(f"row {t[0]}: passive fills {g['passive']} for trade size {t[7]}")
-        want = t[7] if t[5] in resting else 0
-        if g["aggressor"] != want:
-            raise BookError(f"row {t[0]}: aggressor fills {g['aggressor']}, expected {want}")
+        if group["passive"] != size:
+            raise BookError(f"row {row}: passive fills {group['passive']} for trade size {size}")
+        want = size if trade[5] in resting else 0
+        if group["aggressor"] != want:
+            raise BookError(f"row {row}: aggressor fills {group['aggressor']}, expected {want}")
 
-    def _cancel(self, r):
-        oid = r[5]
-        o = self.orders.get(oid)
-        if o is None:
-            raise BookError(f"row {r[0]}: cancel for unknown order {oid}")
-        if r[7] != o[2]:
-            raise BookError(f"row {r[0]}: cancel size {r[7]} vs order size {o[2]}")
-        filled = self.pending.pop(oid, 0)
-        rest = o[2] - filled
+    def _cancel(self, rec):
+        row, oid = rec[0], rec[5]
+        order = self.orders.get(oid)
+        if order is None:
+            raise BookError(f"row {row}: cancel for unknown order {oid}")
+        side, price, size = order
+        if rec[7] != size:
+            raise BookError(f"row {row}: cancel size {rec[7]} vs order size {size}")
+        rest = size - self.pending.pop(oid, 0)
         del self.orders[oid]
         if self.verify:
-            self._native(o[0], o[1], -o[2])
+            self._native(side, price, -size)
         if rest:
-            self._change(o[0], o[1], -rest)
-            self._emit(r, 0, 3, oid, rest, o[1], o[0])
-            self._count("delete")
-        else:
-            self._count("fill_done")
+            self._change(side, price, -rest)
+            self._emit(rec, 0, 3, oid, rest, price, side)
 
-    def _modify(self, r):
-        oid, price, new = r[5], r[6], r[7]
-        o = self.orders.get(oid)
-        if o is None:
-            raise BookError(f"row {r[0]}: modify for unknown order {oid}")
-        side, old_price, size = o
-        if r[4] != side:
-            raise BookError(f"row {r[0]}: modify changes side")
+    def _modify(self, rec):
+        row, oid, price, size = rec[0], rec[5], rec[6], rec[7]
+        order = self.orders.get(oid)
+        if order is None:
+            raise BookError(f"row {row}: modify for unknown order {oid}")
+        side, old_price, old_size = order
+        if rec[4] != side:
+            raise BookError(f"row {row}: modify changes side")
         filled = self.pending.pop(oid, 0)
-        rest = size - filled
+        rest = old_size - filled
         if self.verify:
-            self._native(side, old_price, -size)
-            self._native(side, price, new)
+            self._native(side, old_price, -old_size)
+            self._native(side, price, size)
         if price != old_price:
             if rest:
                 self._change(side, old_price, -rest)
-                self._emit(r, 0, 3, oid, rest, old_price, side)
-            if new:
-                self._change(side, price, new)
-                self._emit(r, 1, 1, oid, new, price, side)
-            self._count("replace")
-        elif new < rest:
-            self._change(side, price, new - rest)
-            self._emit(r, 0, 2 if new else 3, oid, rest - new, price, side)
-            self._count("partial_cancel" if new else "delete")
-        elif new > rest:
+                self._emit(rec, 0, 3, oid, rest, old_price, side)
+            if size:
+                self._change(side, price, size)
+                self._emit(rec, 1, 1, oid, size, price, side)
+        elif size < rest:
+            self._change(side, price, size - rest)
+            self._emit(rec, 0, 2 if size else 3, oid, rest - size, price, side)
+        elif size > rest:  # a larger size, or an iceberg showing more after a fill
             if filled and rest:
-                raise BookError(f"row {r[0]}: size restored on a partly filled order")
+                raise BookError(f"row {row}: size restored on a partly filled order")
             if rest:
                 self._change(side, price, -rest)
-                self._emit(r, 0, 3, oid, rest, price, side)
-            self._change(side, price, new)
-            self._emit(r, 1, 1, oid, new, price, side)
-            self._count("replenish" if filled else "increase")
-        if new:
-            o[1], o[2] = price, new
+                self._emit(rec, 0, 3, oid, rest, price, side)
+            self._change(side, price, size)
+            self._emit(rec, 1, 1, oid, size, price, side)
+        if size:
+            order[1], order[2] = price, size
         else:
             del self.orders[oid]

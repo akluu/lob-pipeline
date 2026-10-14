@@ -3,6 +3,15 @@ import pytest
 from lobpipe.book import EMPTY_ASK, EMPTY_BID, F_LAST, F_SNAPSHOT, Book, BookError
 from tests.streams import IN, OUT, Stream, base, px, random_stream
 
+def consistent(b):
+    """Published depth equals the order book once every fill is confirmed."""
+    depth = {"B": {}, "A": {}}
+    for side, price, size in b.orders.values():
+        depth[side][price] = depth[side].get(price, 0) + size
+    assert not b.pending and depth == b.depth
+    assert all(sorted(depth[s]) == b.prices[s] for s in depth)
+
+
 def run(stream, levels=2):
     b = Book(levels=levels, verify=True)
     out = b.feed(stream.rows)
@@ -33,7 +42,7 @@ def test_add_cancel_reduce_replace_increase():
         (3, 10, 1, lob(99.75), 1), (1, 10, 4, lob(99.75), 1),
         (3, 10, 4, lob(99.75), 1),
     ]
-    b.check()
+    consistent(b)
     # book after the first add: bid 100.00 x 7, 99.75 x 3
     assert out[0][9:] == (lob(100.25), 4, lob(100.00), 7, lob(100.50), 2, lob(99.75), 3)
 
@@ -42,7 +51,7 @@ def test_modify_to_zero_is_a_delete():
     b, out = run(base().event(("M", "A", 4, 100.50, 0)))
     assert msgs(out) == [(3, 4, 2, lob(100.50), -1)]
     assert 4 not in b.orders
-    b.check()
+    consistent(b)
 
 
 def test_passive_fills_full_and_partial():
@@ -53,7 +62,7 @@ def test_passive_fills_full_and_partial():
     assert msgs(out) == [(4, 3, 4, lob(100.25), -1), (4, 4, 1, lob(100.50), -1)]
     assert out[0][9:11] == (lob(100.50), 2)  # depth already reduced on the execution row
     assert out[1][9:11] == (lob(100.50), 1)
-    b.check()
+    consistent(b)
 
 
 def test_iceberg_reserve_and_replenish():
@@ -67,7 +76,7 @@ def test_iceberg_reserve_and_replenish():
         (4, 20, 1, lob(100.25), -1), (5, 20, 1, lob(100.25), -1),
     ]
     assert out[-1][9:11] == out[-2][9:11]  # type 5 leaves depth unchanged
-    b.check()
+    consistent(b)
 
 
 def test_fill_against_an_earlier_aggressor_that_was_never_shown():
@@ -78,8 +87,7 @@ def test_fill_against_an_earlier_aggressor_that_was_never_shown():
     b, out = run(s)
     assert msgs(out) == [(4, 1, 1, lob(100.00), 1), (5, 60, 1, lob(100.00), -1), (1, 60, 2, lob(100.00), -1)]
     assert out[1][9:13] == out[0][9:13]  # type 5 leaves the depth alone
-    assert b.stats["unshown_remainder_execution"] == 1
-    b.check()
+    consistent(b)
 
 
 @pytest.mark.parametrize("events", [
@@ -109,7 +117,7 @@ def test_resting_order_becomes_aggressor():
                      ("M", "B", 1, 100.00, 3), ("C", "A", 4, 100.50, 2))
     b, out = run(s)
     assert msgs(out) == [(4, 1, 2, lob(100.00), 1), (3, 4, 2, lob(100.50), -1)]
-    b.check()
+    consistent(b)
 
 
 def test_out_of_window_records_update_book_but_are_not_written():
@@ -125,8 +133,8 @@ def test_auction_outside_window():
             ("C", "B", 1, 101.00, 2), ("C", "A", 2, 100.00, 2), t=OUT)
     b, out = run(s)
     assert out == []
-    b.check()
-    assert b.best() == (None, px(102.00))
+    consistent(b)
+    assert b.prices["B"] == [] and b.prices["A"][0] == px(102.00)
 
 
 def test_empty_levels_use_lobster_dummies():
@@ -208,7 +216,7 @@ def test_output_does_not_depend_on_batching():
     s = random_stream(7)
     whole = Book(levels=5, verify=True)
     expected = whole.feed(s.rows)
-    whole.check()
+    consistent(whole)
     for cut in (1, 3, 17, 250):
         b = Book(levels=5)
         got = []
