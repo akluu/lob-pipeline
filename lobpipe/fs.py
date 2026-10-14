@@ -21,10 +21,6 @@ def for_spark(uri):
     return "s3a://" + uri[len("s3://"):] if uri.startswith("s3://") else uri
 
 
-def is_local(uri):
-    return "://" not in uri or uri.startswith("file://")
-
-
 def join(uri, *parts):
     return "/".join([uri.rstrip("/"), *parts])
 

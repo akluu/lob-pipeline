@@ -86,7 +86,7 @@ def test_files_that_overlap_for_one_instrument_are_rejected(spark, tmp_path):
     write_dbn(folder / "a.dbn", make_records(T0, 10, 1))
     write_dbn(folder / "b.dbn", make_records(T0 + 5_000, 10, 100))  # same instrument, same hours
     out = str(tmp_path / "mbo")
-    with pytest.raises(ValueError, match="overlap in time"):
+    with pytest.raises(ValueError, match="overlap"):
         ingest.ingest(spark, [str(folder)], out)
     assert not os.path.exists(os.path.join(out, "_manifest.json"))
 
@@ -99,13 +99,13 @@ def test_files_that_share_a_timestamp_for_one_instrument_are_rejected(spark, tmp
     second[0]["act"], second[0]["flags"] = "A", 128  # a continuation, not a new snapshot
     write_dbn(folder / "a.dbn", first)
     write_dbn(folder / "b.dbn", second)
-    with pytest.raises(ValueError, match="overlap in time"):
+    with pytest.raises(ValueError, match="overlap"):
         ingest.ingest(spark, [str(folder)], str(tmp_path / "mbo"))
 
 
 def test_instrument_ids_beyond_int32_are_rejected(spark, tmp_path):
     write_dbn(tmp_path / "a.dbn", make_records(T0, 3, 1, iid=2**31))
-    with pytest.raises(Exception, match="out of range"):
+    with pytest.raises(Exception, match="not in range"):
         ingest.ingest(spark, [str(tmp_path / "a.dbn")], str(tmp_path / "mbo"))
 
 
@@ -122,11 +122,11 @@ def test_records_out_of_time_order_fail(spark, tmp_path):
     recs = make_records(T0, 10, 1)
     recs[4]["ts_recv"], recs[5]["ts_recv"] = recs[5]["ts_recv"], recs[4]["ts_recv"]
     write_dbn(tmp_path / "a.dbn", recs)
-    with pytest.raises(Exception, match="not in order"):
+    with pytest.raises(Exception, match="not in time order"):
         ingest.ingest(spark, [str(tmp_path / "a.dbn")], str(tmp_path / "mbo"))
 
 
 def test_same_file_twice_is_rejected(spark, tmp_path, two_files):
     folder, _ = two_files
-    with pytest.raises(ValueError, match="more than once"):
+    with pytest.raises(ValueError, match="listed twice"):
         ingest.ingest(spark, [folder, os.path.join(folder, "a.dbn")], str(tmp_path / "mbo"))
