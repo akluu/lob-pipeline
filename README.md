@@ -62,8 +62,9 @@ writes 368 million LOBSTER rows (9 GB of Parquet).
 ```
 lobpipe/ingest.py      DBN files -> MBO Parquet
 lobpipe/book.py        order book and the MBO -> LOBSTER event rules
-lobpipe/transform.py   runs a Book over one instrument-day
+lobpipe/transform.py   replays one instrument-day through a Book, keeping its first error
 lobpipe/spark_job.py   the Spark job
+lobpipe/spark.py       Spark session, with the S3 settings
 lobpipe/export.py      LOBSTER CSV files
 lobpipe/check.py       CSV-only consistency check
 lobpipe/fs.py          local paths and s3:// URIs
@@ -74,7 +75,8 @@ Dockerfile             Java, Python, Spark and its S3 jars
 
 ## Usage
 
-Needs Python 3.12+ and Java 17 or 21 for Spark (tested with Java 21), or Docker.
+Needs Python 3.12+ and Java 17 or 21 for Spark (tested with 21 locally and 17 in the
+Docker image), or Docker.
 
 ```
 pip install -r requirements.txt
@@ -185,3 +187,5 @@ python scripts/compare_spark.py --mbo data/mbo --lob data/lob
 pip install -r requirements-dev.txt   # moto, a local S3 server for the S3 test
 pytest
 ```
+
+The first run of the S3 test downloads Spark's S3 jars (about 1 GB) from Maven Central.
