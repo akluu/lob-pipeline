@@ -34,21 +34,36 @@ a missing snapshot, is marked as failed in `_status.json` and the rest of the ru
 On my laptop (M1 Pro, 16 GB, Spark `local[4]`) that data takes about 3 minutes to
 ingest and 50 minutes to rebuild with `--verify`, giving 368 million LOBSTER rows.
 
-## Running it
+## How to use
 
-Needs Python 3.12+ and Java 17 or 21, or Docker.
+You need Python 3.12+ and Java 17 or 21 (or just Docker, see below).
 
-```
-pip install -r requirements.txt
-python -m lobpipe.ingest --out data/mbo data/dbn/
-python -m lobpipe.spark_job --src data/mbo --out data/lob --verify
-python -m lobpipe.export --src data/lob --out data/lobster --dates 2025-10-01 2025-10-02
-python -m lobpipe.check data/lobster/*message_10.csv
-```
+1. Install the packages:
+   ```
+   pip install -r requirements.txt
+   ```
+2. Download MBO data from Databento in DBN format (`.dbn.zst`, split by day) and put the
+   files in `data/dbn/`. No market data is included in this repo.
+3. Convert the files to Parquet:
+   ```
+   python -m lobpipe.ingest --out data/mbo data/dbn/
+   ```
+4. Rebuild the order books. `--verify` double-checks every event but is slower. The job
+   prints how many instrument-days were rebuilt and why any failed.
+   ```
+   python -m lobpipe.spark_job --src data/mbo --out data/lob --verify
+   ```
+5. Export the days you want as LOBSTER CSV files, e.g.
+   `ES_2025-10-01_34200000_57600000_message_10.csv` and the matching `orderbook` file:
+   ```
+   python -m lobpipe.export --src data/lob --out data/lobster --dates 2025-10-01 2025-10-02
+   ```
+6. Optionally, check the CSV files:
+   ```
+   python -m lobpipe.check data/lobster/*message_10.csv
+   ```
 
-`data/dbn/` holds the Databento `.dbn.zst` files (market data isn't included).
-`--verify` also rebuilds the book a second way and fails the day if the two ever
-disagree. Run the tests with `pytest`; the S3 test also needs `requirements-dev.txt`.
+Run the tests with `pytest` (the S3 test also needs `requirements-dev.txt`).
 
 ## Bigger data
 
