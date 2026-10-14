@@ -29,6 +29,10 @@ from lobpipe.transform import et_midnight_ns, feed_rows, output_frame
 
 INPUT_COLUMNS = ["instrument_id", "date", "row_nr", "ts_event", "action", "side", "order_id", "price", "size", "flags"]
 OK = "ok"
+# S3 support: Hadoop's s3a connector (same Hadoop version as PySpark 4.2 ships) and Spark's
+# bridge to the S3A committers
+HADOOP_AWS = "org.apache.hadoop:hadoop-aws:3.5.0"
+SPARK_CLOUD = "https://repo1.maven.org/maven2/org/apache/spark/spark-hadoop-cloud_2.13/4.2.0/spark-hadoop-cloud_2.13-4.2.0.jar"
 
 
 def output_schema(levels):
@@ -146,14 +150,43 @@ def ok_days(lob):
     return {key for key, status in read_statuses(lob).items() if status == OK}
 
 
-def session(name="lobpipe", master="local[4]", batch=50_000, driver_memory="4g"):
-    """A Spark session. Under spark-submit, its master, memory and Python settings are kept."""
+def has_jar(prefix):
+    import pyspark
+
+    return any(f.startswith(prefix) for f in os.listdir(os.path.join(os.path.dirname(pyspark.__file__), "jars")))
+
+
+def session(name="lobpipe", master="local[4]", batch=50_000, driver_memory="4g", s3=False):
+    """A Spark session. Under spark-submit, its master, memory, Python and jar settings are kept.
+
+    S3 goes through Hadoop's s3a connector; credentials come from the usual AWS environment
+    variables or instance role, and AWS_ENDPOINT_URL points it at an S3-compatible store.
+    """
     builder = SparkSession.builder.appName(name)
     if "PYSPARK_GATEWAY_PORT" not in os.environ:  # started with plain python, not spark-submit
         # started from a running interpreter, PySpark ignores spark.pyspark.python, so point
         # the workers at this interpreter (and its packages) explicitly
         os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
         builder = builder.master(master).config("spark.driver.memory", driver_memory)
+        if s3 and not has_jar("hadoop-aws-3.5.0"):
+            builder = builder.config("spark.jars.packages", HADOOP_AWS)
+        if s3 and not has_jar("spark-hadoop-cloud_2.13-4.2.0"):
+            builder = builder.config("spark.jars", SPARK_CLOUD)
+    if s3:
+        # S3 has no rename, so Spark's usual commit (write to a temporary folder, then rename)
+        # would copy every file and could leave a failed attempt's files behind; the S3A
+        # "magic" committer uploads files directly and makes them visible only on commit
+        builder = (builder.config("spark.hadoop.fs.s3a.committer.name", "magic")
+                   .config("spark.sql.sources.commitProtocolClass",
+                           "org.apache.spark.internal.io.cloud.PathOutputCommitProtocol")
+                   .config("spark.sql.parquet.output.committer.class",
+                           "org.apache.spark.internal.io.cloud.BindingParquetOutputCommitter"))
+    if os.environ.get("AWS_ENDPOINT_URL"):
+        builder = (builder.config("spark.hadoop.fs.s3a.endpoint", os.environ["AWS_ENDPOINT_URL"])
+                   .config("spark.hadoop.fs.s3a.path.style.access", "true"))
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if region:
+        builder = builder.config("spark.hadoop.fs.s3a.endpoint.region", region)
     return (builder
             .config("spark.sql.execution.arrow.maxRecordsPerBatch", str(batch))
             .config("spark.sql.sources.partitionColumnTypeInference.enabled", "false")
@@ -174,7 +207,8 @@ def main():
     p.add_argument("--batch", type=int, default=50_000, help="rows per Arrow batch sent to Python")
     p.add_argument("--driver-memory", default="4g")
     args = p.parse_args()
-    spark = session(master=args.master, batch=args.batch, driver_memory=args.driver_memory)
+    s3 = any(p.startswith("s3://") for p in (args.src, args.out))
+    spark = session(master=args.master, batch=args.batch, driver_memory=args.driver_memory, s3=s3)
     statuses = run(spark, args.src, args.out, args.levels, args.dates, args.partitions, args.verify, args.overwrite)
     spark.stop()
     failed = [s for s in statuses if s[2] != OK]

@@ -255,7 +255,8 @@ def main():
     p.add_argument("--master", default="local[4]", help="Spark master, e.g. local[4] or a cluster URL")
     p.add_argument("inputs", nargs="+", help="Databento MBO files or folders of them, local or s3://")
     args = p.parse_args()
-    spark = session(name="lobpipe-ingest", master=args.master)
+    s3 = any(p.startswith("s3://") for p in [args.out, *args.inputs])
+    spark = session(name="lobpipe-ingest", master=args.master, s3=s3)
     ingest(spark, args.inputs, args.out, args.overwrite)
     spark.stop()
 
