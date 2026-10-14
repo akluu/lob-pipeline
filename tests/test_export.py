@@ -55,7 +55,7 @@ def exported(tmp_path):
 def test_names_and_time_format():
     assert file_names("ES", DAY, 10) == (f"ES_{DAY}_34200000_57600000_message_10.csv",
                                          f"ES_{DAY}_34200000_57600000_orderbook_10.csv")
-    assert seconds_text(np.array([34_200_000_000_001, 57_599_123_456_789, 5])).to_pylist() == [
+    assert seconds_text(pa.array([34_200_000_000_001, 57_599_123_456_789, 5])).to_pylist() == [
         "34200.000000001", "57599.123456789", "0.000000005"]
 
 

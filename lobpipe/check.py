@@ -1,18 +1,12 @@
-"""Check a LOBSTER message/orderbook pair for internal consistency.
+"""Check a LOBSTER message/orderbook pair using only the two CSV files.
 
-Uses only the two CSV files. Every orderbook row, the first included, must be a valid
-book: occupied levels have a positive price and size, prices strictly improve toward
-level 1 on each side, empty levels use LOBSTER's dummy price with size 0 and only appear
-below the occupied ones. Starting from the first row, every following row must be the
-previous row with exactly the change its message describes:
-  1 adds size at price, 2/3/4 remove size at price, 5 leaves the book unchanged,
-and the opposite side must not move.
+Every orderbook row must be a valid book (positive prices and sizes, prices improving
+toward level 1, empty levels only below occupied ones), and every row must be the row
+before it changed exactly as its message says: 1 adds size at the price, 2/3/4 remove
+it, 5 changes nothing, and the other side never moves.
 
-What the files cannot show is taken as given and counted in the report:
-  - the first orderbook row (the book as it stood when the window opened)
-  - a level exposed at the bottom when another drops out of the visible depth
-    (its price must be worse than the levels above it; its size is unknown)
-  - messages priced beyond the visible depth, which must leave the rows unchanged
+Taken as given, since the files can't show them: the first row, a level that appears at
+the bottom when one above drops out of view, and messages beyond the visible depth.
 """
 
 import argparse
@@ -28,9 +22,8 @@ EMPTY_BID = -9_999_999_999
 def read(path, ncols, string_first=False):
     names = [f"c{i}" for i in range(ncols)]
     types = {"c0": "string"} if string_first else {}
-    table = pacsv.read_csv(path, read_options=pacsv.ReadOptions(column_names=names),
-                           convert_options=pacsv.ConvertOptions(column_types=types))
-    return table
+    return pacsv.read_csv(path, read_options=pacsv.ReadOptions(column_names=names),
+                          convert_options=pacsv.ConvertOptions(column_types=types))
 
 
 def side_levels(row, side, levels):
@@ -65,23 +58,16 @@ def invalid_rows(book, levels):
 
 
 def expected_levels(prev, price, delta, side, levels):
-    """prev levels after applying delta at price, or None if the change is out of view."""
-    book = dict(prev)
+    """prev levels after adding delta at price (a size can come out negative), and whether
+    prev was full; None if a full book's change is beyond its worst level."""
     full = len(prev) == levels
-    if full:
-        worst = prev[-1][0]
-        beyond = price > worst if side == 0 else price < worst
-        if beyond:
-            return None
-    new = book.get(price, 0) + delta
-    if new < 0:
-        raise ValueError("size below zero")
-    if new:
-        book[price] = new
-    else:
-        book.pop(price, None)
-    ordered = sorted(book.items(), reverse=(side == 1))
-    return ordered[:levels], full
+    if full and (price > prev[-1][0] if side == 0 else price < prev[-1][0]):
+        return None
+    book = dict(prev)
+    book[price] = book.get(price, 0) + delta
+    if book[price] == 0:
+        del book[price]
+    return sorted(book.items(), reverse=(side == 1))[:levels], full
 
 
 def check(message_path, levels=10, max_report=5):
@@ -119,15 +105,14 @@ def check(message_path, levels=10, max_report=5):
             continue
         side = 1 if dirs[i] == 1 else 0
         other = 1 - side
-        if not ((prev[2 * other::4] == cur[2 * other::4]).all() and (prev[2 * other + 1::4] == cur[2 * other + 1::4]).all()):
+        if not (prev.reshape(-1, 2)[other::2] == cur.reshape(-1, 2)[other::2]).all():
             bad(i, "opposite side changed")
             continue
         p_lv, c_lv = side_levels(prev, side, levels), side_levels(cur, side, levels)
         delta = sizes[i] if kind == 1 else -sizes[i]
-        try:
-            exp = expected_levels(p_lv, int(prices[i]), int(delta), side, levels)
-        except ValueError as e:
-            bad(i, str(e))
+        exp = expected_levels(p_lv, int(prices[i]), int(delta), side, levels)
+        if exp is not None and any(size < 0 for _, size in exp[0]):
+            bad(i, "size below zero")
             continue
         if exp is None:
             beyond_depth += 1
