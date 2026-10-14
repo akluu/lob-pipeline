@@ -21,6 +21,7 @@ boto3 = pytest.importorskip("boto3")
 moto_server = pytest.importorskip("moto.server")
 
 DAYS = ["2025-10-02", "2025-10-03"]
+BUCKET = "lobpipe-moto-test"  # a name no one is likely to own, in case a request ever reaches AWS
 
 
 def write_day(path, day, seed):
@@ -37,7 +38,7 @@ def write_day(path, day, seed):
 
 
 @pytest.fixture
-def s3():
+def moto():
     server = moto_server.ThreadedMotoServer(ip_address="127.0.0.1", port=0)
     server.start()
     host, port = server.get_host_and_port()
@@ -45,7 +46,7 @@ def s3():
                AWS_DEFAULT_REGION="us-east-1", AWS_ENDPOINT_URL=f"http://{host}:{port}")
     client = boto3.client("s3", endpoint_url=env["AWS_ENDPOINT_URL"], region_name="us-east-1",
                           aws_access_key_id="testing", aws_secret_access_key="testing")
-    client.create_bucket(Bucket="lob")
+    client.create_bucket(Bucket=BUCKET)
     yield env, client
     server.stop()
 
@@ -58,16 +59,17 @@ def pipeline(env, dbn, mbo, lob, csv):
         assert done.returncode == 0, f"{args[0]}:\n{done.stdout[-2000:]}\n{done.stderr[-4000:]}"
 
 
-def test_pipeline_on_s3_matches_the_run_on_disk(tmp_path, s3, monkeypatch):
-    env, client = s3
+def test_pipeline_on_s3_matches_the_run_on_disk(tmp_path, moto, monkeypatch):
+    env, client = moto
     local = tmp_path / "dbn"
     local.mkdir()
     for seed, day in enumerate(DAYS, start=1):
         name = f"glbx-mdp3-{day.replace('-', '')}.mbo.dbn.zst"
         write_day(local / name, day, seed)
-        client.upload_file(str(local / name), "lob", f"dbn/{name}")
+        client.upload_file(str(local / name), BUCKET, f"dbn/{name}")
 
-    pipeline(env, "s3://lob/dbn", "s3://lob/mbo", "s3://lob/lob", str(tmp_path / "csv_s3"))
+    s3 = f"s3://{BUCKET}"
+    pipeline(env, f"{s3}/dbn/", f"{s3}/mbo", f"{s3}/lob", str(tmp_path / "csv_s3"))
     pipeline(env, str(local), str(tmp_path / "mbo"), str(tmp_path / "lob"), str(tmp_path / "csv_disk"))
 
     names = sorted(os.listdir(tmp_path / "csv_disk"))
@@ -78,9 +80,9 @@ def test_pipeline_on_s3_matches_the_run_on_disk(tmp_path, s3, monkeypatch):
 
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL"):
         monkeypatch.setenv(k, env[k])
-    assert read_json("s3://lob/mbo/_manifest.json")["dates"] == read_json(str(tmp_path / "mbo" / "_manifest.json"))["dates"]
-    assert read_json("s3://lob/lob/_status.json") == read_json(str(tmp_path / "lob" / "_status.json"))
+    assert read_json(f"{s3}/mbo/_manifest.json")["dates"] == read_json(str(tmp_path / "mbo" / "_manifest.json"))["dates"]
+    assert read_json(f"{s3}/lob/_status.json") == read_json(str(tmp_path / "lob" / "_status.json"))
     # Spark committed both S3 datasets through the S3A committer, which reports itself in _SUCCESS
     for key in ("mbo/_SUCCESS", "lob/_SUCCESS"):
-        success = json.loads(client.get_object(Bucket="lob", Key=key)["Body"].read())
+        success = json.loads(client.get_object(Bucket=BUCKET, Key=key)["Body"].read())
         assert success["committer"] == "magic"
