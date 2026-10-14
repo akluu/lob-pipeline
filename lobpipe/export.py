@@ -6,10 +6,11 @@ event type, order id, size, price (dollars x 10000), direction. Orderbook column
 ask price 1, ask size 1, bid price 1, bid size 1, ... for each level.
 
 Only a finished Spark output (_SUCCESS and _status.json) is read, which can be local or on
-S3, and only instrument-days whose rebuild succeeded are written. The CSV files go to a
-local folder: all requested days are written to <out>.partial and published with a single
-directory rename, so a reader never sees a half-written file or a message file without
-its orderbook.
+S3, and only instrument-days whose rebuild succeeded are written. A day is sorted and
+written in slices, so memory stays near the size of that day's rows in Arrow. The CSV
+files go to a local folder: all requested days are written to <out>.partial and published
+with a single directory rename, so a reader never sees a half-written file or a message
+file without its orderbook.
 """
 
 import argparse
@@ -28,12 +29,15 @@ from lobpipe.fs import join, resolve
 from lobpipe.spark_job import ok_days
 
 MESSAGE_COLUMNS = ["type", "order_id", "size", "price", "direction"]
+SLICE = 1_000_000
 
 
 def seconds_text(time_ns):
-    whole = (time_ns // 10**9).astype(str)
-    frac = np.char.zfill((time_ns % 10**9).astype(str), 9)
-    return np.char.add(np.char.add(whole, "."), frac)
+    """Seconds after midnight with 9 decimals, e.g. 34200.000000001 (times are never negative)."""
+    t = time_ns if isinstance(time_ns, (pa.Array, pa.ChunkedArray)) else pa.array(time_ns, type=pa.int64())
+    whole = pc.divide(t, 10**9)
+    frac = pc.subtract(t, pc.multiply(whole, 10**9))
+    return pc.binary_join_element_wise(pc.cast(whole, pa.string()), pc.utf8_lpad(pc.cast(frac, pa.string()), 9, "0"), ".")
 
 
 def file_names(ticker, day, levels, window=(34_200_000, 57_600_000)):
@@ -52,20 +56,27 @@ def export_day(src, day, out_dir, ticker="ES", levels=10, instrument_id=None, ok
     elif (instrument_id, day) not in ok:
         raise ValueError(f"{day} instrument {instrument_id} was not rebuilt successfully, see _status.json")
     fs, path = resolve(join(src, f"date={day}"))
-    table = pq.read_table(path, filesystem=fs, filters=[("instrument_id", "=", instrument_id)])
-    df = table.filter(pc.is_null(table["status"])).to_pandas()  # leave out the status row
-    df = df.sort_values(["row_nr", "sub"], kind="stable")
-    if df.duplicated(["row_nr", "sub"]).any():
+    # data rows only: the status row that ends each instrument-day is left out
+    rows = (pc.field("instrument_id") == instrument_id) & pc.field("status").is_null()
+    table = pq.read_table(path, filesystem=fs, filters=rows, columns=["row_nr", "sub", "time_ns"]
+                          + MESSAGE_COLUMNS + book_columns(levels))
+    order = pc.sort_indices(table, sort_keys=[("row_nr", "ascending"), ("sub", "ascending")])
+    keys = np.column_stack([table["row_nr"].to_numpy(), table["sub"].to_numpy()])[order.to_numpy()]
+    if (np.diff(keys, axis=0) == 0).all(axis=1).any():
         raise ValueError(f"{day}: duplicate (row_nr, sub) keys")
 
     msg_path, book_path = (os.path.join(out_dir, n) for n in file_names(ticker, day, levels))
     opts = pacsv.WriteOptions(include_header=False)
-    messages = pa.table({"time": seconds_text(df["time_ns"].to_numpy())}
-                        | {c: df[c].to_numpy() for c in MESSAGE_COLUMNS})
-    book = pa.table({c: df[c].to_numpy() for c in book_columns(levels)})
-    pacsv.write_csv(messages, msg_path, opts)
-    pacsv.write_csv(book, book_path, opts)
-    return len(df)
+    msg_schema = pa.schema([("time", pa.string())] + [(c, pa.int64()) for c in MESSAGE_COLUMNS])
+    book_schema = pa.schema([(c, pa.int64()) for c in book_columns(levels)])
+    with pacsv.CSVWriter(msg_path, msg_schema, write_options=opts) as messages, \
+            pacsv.CSVWriter(book_path, book_schema, write_options=opts) as book:
+        for lo in range(0, table.num_rows, SLICE):
+            part = table.take(order[lo:lo + SLICE])
+            messages.write_table(pa.table([seconds_text(part["time_ns"])] + [part[c] for c in MESSAGE_COLUMNS],
+                                          schema=msg_schema))
+            book.write_table(part.select(book_columns(levels)).cast(book_schema))
+    return table.num_rows
 
 
 def export(src, dates, out_dir, ticker="ES", levels=10, overwrite=False, instrument_id=None):

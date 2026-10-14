@@ -55,8 +55,8 @@ def exported(tmp_path):
 def test_names_and_time_format():
     assert file_names("ES", DAY, 10) == (f"ES_{DAY}_34200000_57600000_message_10.csv",
                                          f"ES_{DAY}_34200000_57600000_orderbook_10.csv")
-    assert seconds_text(np.array([34_200_000_000_001, 57_599_123_456_789])).tolist() == [
-        "34200.000000001", "57599.123456789"]
+    assert seconds_text(np.array([34_200_000_000_001, 57_599_123_456_789, 5])).to_pylist() == [
+        "34200.000000001", "57599.123456789", "0.000000005"]
 
 
 def test_export_round_trip_and_check(exported):
@@ -68,6 +68,15 @@ def test_export_round_trip_and_check(exported):
     assert len(ob.read_text().splitlines()) == n
     assert sorted(os.listdir(msg.parent)) == sorted(n for d in DAYS for n in file_names("ES", d, 5))
     assert check(str(msg), levels=5) == []
+
+
+def test_output_does_not_depend_on_slice_size(tmp_path, monkeypatch):
+    write_lob(tmp_path / "lob")
+    export(str(tmp_path / "lob"), [DAY], str(tmp_path / "whole"), levels=5)
+    monkeypatch.setattr(exp, "SLICE", 7)
+    export(str(tmp_path / "lob"), [DAY], str(tmp_path / "sliced"), levels=5)
+    for name in file_names("ES", DAY, 5):
+        assert (tmp_path / "sliced" / name).read_bytes() == (tmp_path / "whole" / name).read_bytes()
 
 
 def test_publishing_is_all_or_nothing(tmp_path, monkeypatch):
