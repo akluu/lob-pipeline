@@ -16,13 +16,12 @@ import sys
 from datetime import date, timedelta
 from multiprocessing import Pool
 
-import numpy as np
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lobpipe.book import F_LAST, Book, BookError  # noqa: E402
+from lobpipe.book import F_LAST  # noqa: E402
 from lobpipe.fs import join, read_json, resolve  # noqa: E402
-from lobpipe.transform import rebuild_chunks  # noqa: E402
+from lobpipe.transform import OK, Day  # noqa: E402
 
 COLUMNS = ["row_nr", "ts_event", "instrument_id", "action", "side", "order_id", "price", "size", "flags"]
 
@@ -31,7 +30,10 @@ def load(mbo, day, iid):
     """Every row of one instrument on one day, in file order (row_nr)."""
     fs, path = resolve(join(mbo, f"date={day}"))
     table = pq.read_table(path, filesystem=fs, columns=COLUMNS, filters=[("instrument_id", "=", iid)])
-    return table.to_pandas().sort_values("row_nr", kind="stable", ignore_index=True)
+    rows = table.to_pandas().sort_values("row_nr", ignore_index=True)
+    if rows["row_nr"].duplicated().any():
+        raise ValueError(f"{day} instrument {iid}: the same row_nr appears twice")
+    return rows
 
 
 def opening_event(mbo, day, iid):
@@ -41,30 +43,24 @@ def opening_event(mbo, day, iid):
     return rows.iloc[:int(ends[0]) + 1] if len(ends) else rows
 
 
-def run(book, rows, day):
-    """Replay rows through book; return its orders {order_id: [side, price, size]}."""
-    if (np.diff(rows["row_nr"].to_numpy()) <= 0).any():
-        raise BookError(f"rows of {day} are not in row_nr order")
-    for _ in rebuild_chunks(book, rows, day):
+def replay(rows, day, iid):
+    """The orders left after replaying the rows, and "ok" or what went wrong."""
+    replayed = Day(iid, day)
+    for _ in replayed.feed(rows):
         pass
-    book.finish()
-    if not book.initialized:
-        raise BookError(f"no snapshot in the rows of {day}")
-    return book.orders
+    return replayed.book.orders, replayed.finish()
 
 
 def compare_pair(args):
     mbo, day, nxt, iid = args
-    # Book rejects an opening event that is not a reset followed by snapshot adds with
-    # unique order ids and a B or A side, and one cut off before its last record
-    try:
-        expected = run(Book(levels=10), opening_event(mbo, nxt, iid), nxt)
-    except BookError as e:
-        return day, nxt, iid, None, None, f"BAD SNAPSHOT ({e})"
-    try:
-        rebuilt = run(Book(levels=10), load(mbo, day, iid), day)
-    except BookError as e:
-        return day, nxt, iid, None, None, f"REBUILD FAILED ({e})"
+    # the next day must open with a valid snapshot: a reset and snapshot adds with unique
+    # order ids and a B or A side, not cut off before its last record
+    expected, status = replay(opening_event(mbo, nxt, iid), nxt, iid)
+    if status != OK:
+        return day, nxt, iid, None, None, f"BAD SNAPSHOT ({status})"
+    rebuilt, status = replay(load(mbo, day, iid), day, iid)
+    if status != OK:
+        return day, nxt, iid, None, None, f"REBUILD FAILED ({status})"
     return day, nxt, iid, len(rebuilt), len(expected), "identical" if rebuilt == expected else "DIFFERENT"
 
 

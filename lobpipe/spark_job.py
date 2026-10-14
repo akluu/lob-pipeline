@@ -14,17 +14,15 @@ import argparse
 import sys
 from functools import partial
 
-import numpy as np
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, LongType, StringType, StructField, StructType
 
-from lobpipe.book import COLUMNS, Book, BookError, book_columns
+from lobpipe.book import COLUMNS, book_columns
 from lobpipe.fs import exists, for_spark, join, read_json, write_json
 from lobpipe.spark import session
-from lobpipe.transform import et_midnight_ns, feed_rows, output_frame
+from lobpipe.transform import OK, Day
 
 INPUT_COLUMNS = ["instrument_id", "date", "row_nr", "ts_event", "action", "side", "order_id", "price", "size", "flags"]
-OK = "ok"
 
 
 def output_schema(levels):
@@ -34,42 +32,6 @@ def output_schema(levels):
     return StructType(fields)
 
 
-class Day:
-    """One instrument-day going through its Book. The first error is kept, not raised."""
-
-    def __init__(self, key, levels, verify):
-        self.key, self.levels = key, levels
-        self.book = Book(levels=levels, verify=verify)
-        self.midnight = et_midnight_ns(key[1])
-        self.rows_read = 0
-        self.error = None
-
-    def _run(self, step):
-        if self.error is None:
-            try:  # a day the book can't explain is reported, the rest of the run goes on
-                return step()
-            except BookError as e:
-                self.error = str(e)
-        return []
-
-    def feed(self, rows):
-        self.rows_read += len(rows)
-        out = self._run(lambda: self.book.feed(feed_rows(rows, self.midnight)))
-        return self._frame(output_frame(out, self.levels)) if out else None
-
-    def status_row(self):
-        self._run(self.book.finish)
-        zeros = output_frame([[0] * (len(COLUMNS) + 4 * self.levels)], self.levels)
-        return self._frame(zeros, self.error or OK, self.rows_read)
-
-    def _frame(self, frame, status=None, rows_read=None):
-        frame.insert(0, "date", self.key[1])
-        frame.insert(0, "instrument_id", np.int32(self.key[0]))
-        frame["status"] = status
-        frame["input_rows"] = rows_read
-        return frame
-
-
 def rebuild_partition(batches, levels=10, verify=False):
     """mapInPandas body. Rows arrive sorted by (instrument_id, date, row_nr)."""
     day = None
@@ -77,13 +39,11 @@ def rebuild_partition(batches, levels=10, verify=False):
         keys = list(zip(pdf["instrument_id"].tolist(), pdf["date"].tolist()))
         starts = [0] + [i for i in range(1, len(keys)) if keys[i] != keys[i - 1]]
         for lo, hi in zip(starts, starts[1:] + [len(keys)]):
-            if day is None or day.key != keys[lo]:
+            if day is None or (day.instrument_id, day.day) != keys[lo]:
                 if day is not None:
                     yield day.status_row()
-                day = Day(keys[lo], levels, verify)
-            out = day.feed(pdf.iloc[lo:hi])
-            if out is not None:
-                yield out
+                day = Day(*keys[lo], levels, verify)
+            yield from day.feed(pdf.iloc[lo:hi])
     if day is not None:
         yield day.status_row()
 

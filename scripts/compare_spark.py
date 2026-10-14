@@ -22,10 +22,10 @@ import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lobpipe.book import COLUMNS, Book, BookError, book_columns  # noqa: E402
+from lobpipe.book import COLUMNS, book_columns  # noqa: E402
 from lobpipe.fs import exists, join, list_dates, resolve  # noqa: E402
-from lobpipe.spark_job import OK, read_statuses  # noqa: E402
-from lobpipe.transform import rebuild_chunks  # noqa: E402
+from lobpipe.spark_job import read_statuses  # noqa: E402
+from lobpipe.transform import OK, Day  # noqa: E402
 
 VALUES = COLUMNS + book_columns(10)
 INPUT = ["row_nr", "ts_event", "instrument_id", "action", "side", "order_id", "price", "size", "flags"]
@@ -56,18 +56,14 @@ def direct_rows(mbo, day):
     rows = rows.sort_values(["instrument_id", "row_nr"], kind="stable", ignore_index=True)
     keys, hashes, statuses = [], [], {}
     for iid, group in rows.groupby("instrument_id", sort=True):
-        book, k, h = Book(levels=10), [], []
-        try:
-            for frame in rebuild_chunks(book, group, day):
-                k.append(key_array(iid, frame))
-                h.append(row_hashes(frame))
-            book.finish()
-        except BookError as e:
-            statuses[int(iid)] = str(e)
-            continue
-        statuses[int(iid)] = OK
-        keys += k
-        hashes += h
+        replayed, day_keys, day_hashes = Day(int(iid), day), [], []
+        for frame in replayed.feed(group):
+            day_keys.append(key_array(iid, frame))
+            day_hashes.append(row_hashes(frame))
+        statuses[int(iid)] = replayed.finish()
+        if statuses[int(iid)] == OK:
+            keys += day_keys
+            hashes += day_hashes
     return *stack(keys, hashes), statuses
 
 

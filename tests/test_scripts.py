@@ -101,6 +101,13 @@ def test_opening_event_is_found_by_row_number_not_file_name(tmp_path, monkeypatc
     assert "1 of 1 day boundaries identical" in capsys.readouterr().out
 
 
+def test_repeated_row_numbers_are_rejected(tmp_path, monkeypatch):
+    day1 = random_stream(1, n_events=300)
+    write_mbo(str(tmp_path), [(DAY1, 7, day1.rows + day1.rows[-2:]), (DAY2, 7, next_day(closing_book(day1)))])
+    with pytest.raises(ValueError, match="appears twice"):
+        run_main(check_snapshots, ["--mbo", str(tmp_path)], monkeypatch)
+
+
 def test_missing_day_fails_even_against_an_empty_snapshot(tmp_path, monkeypatch, capsys):
     empty = [(0, OUT, OUT, "R", "N", 0, 2**63 - 1, 0, F_SNAPSHOT | F_LAST)]
     write_mbo(str(tmp_path), [(DAY1, 7, []), (DAY2, 7, empty)])
