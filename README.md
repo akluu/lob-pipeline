@@ -1,8 +1,8 @@
 # lob-pipeline
 
 Turns CME market-by-order data (Databento MBO) into [LOBSTER](https://lobsterdata.com)
-limit order book files using Apache Spark. I built it on two months of E-mini S&P 500
-futures (ES) data from September and October 2025, about 486 million order messages.
+limit order book files using Apache Spark. Tested on 8 GB of compressed data (486
+million order messages).
 
 ## How it works
 
@@ -31,7 +31,7 @@ and `row_nr`, and `mapInPandas` streams it through a `Book` (`lobpipe/book.py`),
 plain Python and tested without Spark. A day that can't be rebuilt, for example one with
 a missing snapshot, is marked as failed in `_status.json` and the rest of the run goes on.
 
-On my laptop (M1 Pro, 16 GB, Spark `local[4]`) the two months take about 3 minutes to
+On my laptop (M1 Pro, 16 GB, Spark `local[4]`) that data takes about 3 minutes to
 ingest and 50 minutes to rebuild with `--verify`, giving 368 million LOBSTER rows.
 
 ## Running it
